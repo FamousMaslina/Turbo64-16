@@ -1,0 +1,71 @@
+"""Measure uncached prefill on a running llama-server using only Python's standard library."""
+
+import argparse
+import datetime
+import json
+import statistics
+import time
+import urllib.request
+from pathlib import Path
+
+
+def request(url, path, payload=None):
+    data = None if payload is None else json.dumps(payload).encode()
+    req = urllib.request.Request(url.rstrip("/") + path, data=data, headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=3600) as response:
+        return json.load(response)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--url", default="http://127.0.0.1:5559")
+    parser.add_argument("--tokens", type=int, default=1024)
+    parser.add_argument("--repetitions", type=int, default=3)
+    parser.add_argument("--generate", type=int, default=16)
+    parser.add_argument("--label", default="turbo2")
+    parser.add_argument("--output", type=Path)
+    args = parser.parse_args()
+    if args.tokens < 32 or args.tokens + args.generate >= 65536 or args.generate < 1 or args.repetitions < 1:
+        parser.error("Use 32 <= tokens, 1 <= generate, tokens + generate < 65536, repetitions >= 1.")
+
+    request(args.url, "/health")
+    report = {
+        "label": args.label,
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "server": request(args.url, "/props"),
+        "tokens_requested": args.tokens,
+        "runs": [],
+    }
+    prose = "Explain how memory capacity, disk bandwidth, and transfer latency affect large language model inference. "
+    for index in range(args.repetitions):
+        # Change the start of every prompt so the server cannot reuse a previous KV prefix.
+        prefix = f"Independent benchmark {args.label} {index} {time.time_ns()}. "
+        tokens = request(args.url, "/tokenize", {"content": prefix + prose * args.tokens})["tokens"][:args.tokens]
+        if len(tokens) != args.tokens:
+            raise RuntimeError("Tokenizer returned too few tokens.")
+        started = time.perf_counter()
+        result = request(args.url, "/completion", {
+            "prompt": tokens,
+            "n_predict": args.generate,
+            "temperature": 0,
+            "seed": 1234,
+            "cache_prompt": False,
+            "stream": False,
+        })
+        if result["timings"].get("cache_n", 0) != 0 or result["timings"]["prompt_n"] != args.tokens:
+            raise RuntimeError("The server reused a prompt prefix or processed a different token count; discard this run.")
+        run = {"wall_seconds": time.perf_counter() - started, "timings": result["timings"],
+               "tokens_cached": result.get("tokens_cached")}
+        report["runs"].append(run)
+        print(json.dumps(run), flush=True)
+        output = args.output or Path(__file__).parent / f"results-{args.label}.json"
+        output.write_text(json.dumps(report, indent=2), encoding="utf-8")
+
+    rates = [run["timings"]["prompt_per_second"] for run in report["runs"]]
+    report["median_prompt_tokens_per_second"] = statistics.median(rates)
+    output.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    print(f"Median prefill: {statistics.median(rates):.2f} tokens/s. Saved {output}")
+
+
+if __name__ == "__main__":
+    main()

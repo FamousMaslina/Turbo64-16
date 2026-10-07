@@ -1,0 +1,1308 @@
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -15,6 +15,7 @@
+     llama-batch.cpp
+     llama-chat.cpp
+     llama-context.cpp
++    ../turbo64-16/expert-stream.cpp
+     llama-cparams.cpp
+     llama-grammar.cpp
+     llama-graph.cpp
+@@ -64,11 +65,22 @@
+ 
+ configure_file(llama-version.h.in ${CMAKE_CURRENT_BINARY_DIR}/llama-version.h @ONLY)
+ 
+-target_include_directories(llama PRIVATE . ${CMAKE_CURRENT_BINARY_DIR})
++target_include_directories(llama PRIVATE . ${CMAKE_CURRENT_BINARY_DIR} ../turbo64-16)
+ target_include_directories(llama PUBLIC ../include)
+ target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
+ 
+ target_link_libraries(llama PUBLIC ggml)
++
++if (LLAMA_BUILD_TESTS)
++    add_executable(test-turbo64-16
++        ../turbo64-16/test-expert-stream.cpp
++        ../turbo64-16/expert-stream.cpp
++        llama-mmap.cpp
++        llama-impl.cpp)
++    target_include_directories(test-turbo64-16 PRIVATE . ../include ../turbo64-16)
++    target_compile_features(test-turbo64-16 PRIVATE cxx_std_17)
++    target_link_libraries(test-turbo64-16 PRIVATE ggml)
++endif()
+ 
+ if (BUILD_SHARED_LIBS)
+     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -10,6 +10,7 @@
+ 
+ #include "ggml-cpp.h"
+ #include "ggml-opt.h"
++#include "expert-stream.h"
+ 
+ #include <array>
+ #include <map>
+@@ -376,6 +377,7 @@
+ 
+     ggml_backend_t backend_cpu = nullptr;
+     std::vector<ggml_backend_ptr> backends;
++    turbo64_16_stream expert_stream;
+ 
+     // training
+     ggml_opt_context_t opt_ctx = nullptr;
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -2633,8 +2633,10 @@
+     }
+ 
+     copy_experts.reset();
++    expert_stream.begin_graph();
+ 
+     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
++    expert_stream.end_graph(status);
+     if (status != GGML_STATUS_SUCCESS) {
+         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
+     }
+@@ -2645,7 +2647,8 @@
+ }
+ 
+ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data) {
+-    auto & st = static_cast<llama_context *>(user_data)->copy_experts;
++    auto & ctx = *static_cast<llama_context *>(user_data);
++    auto & st = ctx.copy_experts;
+ 
+     // the ids must be computed before the split starts, so only the first node of the split is considered
+     if (ggml_graph_n_nodes(graph) == 0) {
+@@ -2679,6 +2682,10 @@
+         }
+ 
+         st.ids = ids;
++    }
++
++    if (ctx.expert_stream.copy(backend, src, dst, st.used, ids->ne[1])) {
++        return true;
+     }
+ 
+     // group consecutive experts and copy them together
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -5,6 +5,7 @@
+ #include "gguf.h"
+ #include "llama-hparams.h"
+ #include "llama.h"
++#include "expert-stream.h"
+ 
+ #include <algorithm>
+ #include <array>
+@@ -1239,8 +1240,13 @@
+                 if (std::regex_search(tensor_name, pattern)) {
+                     if (overrides->buft == ggml_backend_cpu_buffer_type()) {
+                         // when overriding to a CPU buffer, consider the extra buffer types
+-                        buft = select_weight_buft(hparams, t_meta, op, buft_list_cpu);
+-                        if (use_mmap) {
++                        if (turbo64_16_mode() && use_mmap && op == GGML_OP_MUL_MAT_ID) {
++                            // Keep expert weights file-backed instead of making a repacked heap copy.
++                            buft = ggml_backend_cpu_buffer_type();
++                        } else {
++                            buft = select_weight_buft(hparams, t_meta, op, buft_list_cpu);
++                        }
++                        if (use_mmap && !turbo64_16_mode()) {
+                             static std::once_flag once;
+                             std::call_once(once, [] {
+                                 LLAMA_LOG_WARN("llama_model_loader: tensor overrides to CPU are used with mmap enabled - consider using --load-mode none for better performance\n");
+@@ -1408,6 +1414,10 @@
+ }
+ 
+ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps) {
++    if (turbo64_16_mode() && use_mmap) {
++        prefetch = false;
++        LLAMA_LOG_INFO("Turbo64-16: whole-model mmap prefetch disabled\n");
++    }
+     // note: read_lazy also requires mmap; this condition make sure it's usable even when --load-mode is not set to mmap
+     if (use_mmap || lazy.any()) {
+         mappings.reserve(files.size());
+--- a/tools/server/CMakeLists.txt
++++ b/tools/server/CMakeLists.txt
+@@ -67,3 +67,5 @@
+ 
+ target_link_libraries(${TARGET} PRIVATE llama-server-impl)
+ target_compile_features(${TARGET} PRIVATE cxx_std_17)
++
++add_subdirectory(${PROJECT_SOURCE_DIR}/turbo64-16 ${CMAKE_CURRENT_BINARY_DIR}/turbo64-16)
+--- a/common/log.h
++++ b/common/log.h
+@@ -46,6 +46,10 @@
+ bool common_log_get_jsonl(void);
+ 
+ void common_log_set_jsonl(bool jsonl); // not thread-safe
++
++using common_log_metadata_filter = bool (*)(const char * message, bool formatted);
++void common_log_set_metadata_only(common_log_metadata_filter filter);
++bool common_log_is_metadata_only();
+ 
+ int common_log_get_verbosity(enum ggml_log_level level);
+ 
+--- a/common/log.cpp
++++ b/common/log.cpp
+@@ -13,6 +13,7 @@
+ #include <thread>
+ #include <vector>
+ #include <algorithm>
++#include <atomic>
+ 
+ int common_log_verbosity_thold = LOG_DEFAULT_LLAMA;
+ 
+@@ -25,6 +26,22 @@
+ }
+ 
+ static bool common_log_jsonl = false;
++static std::atomic<common_log_metadata_filter> metadata_filter { nullptr };
++
++void common_log_set_metadata_only(common_log_metadata_filter filter) {
++    GGML_ASSERT(filter != nullptr);
++    common_log_metadata_filter expected = nullptr;
++    metadata_filter.compare_exchange_strong(expected, filter);
++}
++
++bool common_log_is_metadata_only() {
++    return metadata_filter.load() != nullptr;
++}
++
++static bool metadata_allowed(const char * message, bool formatted) {
++    auto filter = metadata_filter.load();
++    return !filter || filter(message, formatted);
++}
+ 
+ bool common_log_get_jsonl(void) {
+     return common_log_jsonl;
+@@ -232,7 +249,10 @@
+         return head == tail;
+     }
+ 
+-    void add(enum ggml_log_level level, const char * fmt, va_list args) {
++    void add(enum ggml_log_level level, const char * fmt, va_list args, bool checked = false) {
++        if (!checked && !metadata_allowed(fmt, false)) {
++            return;
++        }
+         std::unique_lock<std::mutex> lock(mtx);
+ 
+         // block if the queue is full
+@@ -486,7 +506,7 @@
+ }
+ 
+ void common_log_add_json(struct common_log * log, const char * type, const common_json & obj) {
+-    if (!common_log_jsonl) {
++    if (!common_log_jsonl || common_log_is_metadata_only()) {
+         return;
+     }
+ 
+@@ -542,9 +562,16 @@
+     }
+ }
+ 
++static void common_log_add_checked(struct common_log * log, ggml_log_level level, const char * fmt, ...) {
++    va_list args;
++    va_start(args, fmt);
++    log->add(level, fmt, args, true);
++    va_end(args);
++}
++
+ void common_log_default_callback(enum ggml_log_level level, const char * text, void * /*user_data*/) {
+     auto verbosity = common_log_get_verbosity(level);
+-    if (verbosity <= common_log_verbosity_thold) {
+-        common_log_add(common_log_main(), level, "%s", text);
+-    }
+-}
++    if (verbosity <= common_log_verbosity_thold && metadata_allowed(text, true)) {
++        common_log_add_checked(common_log_main(), level, "%s", text);
++    }
++}
+--- a/common/chat.cpp
++++ b/common/chat.cpp
+@@ -1477,7 +1477,7 @@
+     //LOG_DBG("Parsing PEG input with format %s: %s\n", common_chat_format_name(params.format), effective_input.c_str());
+ 
+     common_peg_parse_flags flags = COMMON_PEG_PARSE_FLAG_LENIENT;
+-    if (params.debug) {
++    if (params.debug && !common_log_is_metadata_only()) {
+         flags |= COMMON_PEG_PARSE_FLAG_DEBUG;
+     }
+ 
+@@ -1530,7 +1530,7 @@
+         fflush(stderr);
+     }
+ 
+-    if (!is_partial) {
++    if (!is_partial && !common_log_is_metadata_only()) {
+         LOG_DBG("Parsed message: %s\n", common_chat_msgs_to_json_oaicompat({ msg }).at(0).dump().c_str());
+     }
+     return msg;
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -4629,7 +4629,7 @@
+         // TODO: this log can become very long, put it behind a flag or think about a more compact format
+         //SRV_DBG("Prompt: %s\n", prompt.is_string() ? prompt.get<std::string>().c_str() : prompt.dump(2).c_str());
+ 
+-        if (!params.path_prompts_log_dir.empty()) {
++        if (!params.path_prompts_log_dir.empty() && !common_log_is_metadata_only()) {
+             const auto file_path = std::filesystem::path(params.path_prompts_log_dir) / string_format("%012" PRId64 ".txt", ggml_time_ms());
+             std::ofstream f(file_path);
+             if (f) {
+--- a/tools/server/server-http.cpp
++++ b/tools/server/server-http.cpp
+@@ -51,6 +51,10 @@
+ }
+ 
+ static void log_server_request(const httplib::Request & req, const httplib::Response & res) {
++    if (common_log_is_metadata_only()) {
++        SRV_TRC("HTTP metadata: status=%d request_bytes=%zu response_bytes=%zu\n", res.status, req.body.size(), res.body.size());
++        return;
++    }
+     // skip logging requests that are regularly sent, to avoid log spam
+     if (req.path == "/health"
+         || req.path == "/v1/health"
+@@ -179,6 +183,9 @@
+ 
+     srv->set_default_headers({{"Server", "llama.cpp"}});
+     // srv->set_logger(log_server_request); // TODO @ngxson : this is too spamy, no very useful; improve it in the future
++    if (common_log_is_metadata_only()) {
++        srv->set_logger(log_server_request);
++    }
+     srv->set_exception_handler([](const httplib::Request &, httplib::Response & res, const std::exception_ptr & ep) {
+         // this is fail-safe; exceptions should already handled by `ex_wrapper`
+ 
+--- /dev/null
++++ b/turbo64-16/expert-stream.h
+@@ -0,0 +1,42 @@
++#pragma once
++
++#include "ggml-cpp.h"
++
++#include <array>
++#include <vector>
++
++int turbo64_16_mode();
++
++struct turbo64_16_stream {
++    ~turbo64_16_stream();
++
++    bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, const std::vector<bool> & used, int64_t n_tokens);
++    void begin_graph();
++    void end_graph(ggml_status status);
++
++private:
++    struct slot {
++        ggml_backend_buffer_ptr buffer;
++        ggml_backend_event_ptr event;
++        bool pending = false;
++    };
++
++    bool init(ggml_backend_t backend);
++
++    std::array<slot, 2> slots;
++    ggml_backend_dev_t device = nullptr;
++    size_t next_slot = 0;
++    bool attempted = false;
++
++    struct transfer_stats {
++        size_t tensors = 0;
++        size_t experts = 0;
++        size_t bytes = 0;
++        size_t chunks = 0;
++        int64_t prefetch_us = 0;
++        int64_t wait_us = 0;
++        int64_t stage_us = 0;
++        int64_t enqueue_us = 0;
++    } stats;
++    int64_t graph_start_us = 0;
++};
+--- /dev/null
++++ b/turbo64-16/expert-stream.cpp
+@@ -0,0 +1,192 @@
++#include "expert-stream.h"
++
++#include "llama-impl.h"
++#include "llama-mmap.h"
++
++#include <algorithm>
++#include <cstdlib>
++#include <cstring>
++
++static constexpr size_t stage_size = 32 * 1024 * 1024;
++static constexpr size_t prefetch_size = 128 * 1024 * 1024;
++
++static bool diagnostics_enabled() {
++    static const bool enabled = [] {
++        const char * value = std::getenv("TURBO64_16_DIAGNOSTICS");
++        return value && std::strcmp(value, "1") == 0;
++    }();
++    return enabled;
++}
++
++void turbo64_16_stream::begin_graph() {
++    if (diagnostics_enabled()) {
++        stats = {};
++        graph_start_us = ggml_time_us();
++    }
++}
++
++void turbo64_16_stream::end_graph(ggml_status status) {
++    if (diagnostics_enabled()) {
++        LLAMA_LOG_INFO("Turbo64-16 graph: status=%d submit_ms=%.2f expert_tensors=%zu selected_matrices=%zu upload_requested=%.2f MiB chunks=%zu prefetch_ms=%.2f host_stage_ms=%.2f buffer_wait_ms=%.2f enqueue_ms=%.2f\n",
++                (int) status, (ggml_time_us() - graph_start_us) / 1000.0, stats.tensors, stats.experts,
++                stats.bytes / 1048576.0, stats.chunks, stats.prefetch_us / 1000.0,
++                stats.stage_us / 1000.0, stats.wait_us / 1000.0, stats.enqueue_us / 1000.0);
++    }
++}
++
++int turbo64_16_mode() {
++    static const int mode = [] {
++#ifdef _WIN32
++        const char * value = std::getenv("TURBO64_16");
++        if (value && std::strcmp(value, "1") == 0) {
++            return 1;
++        }
++        if (value && std::strcmp(value, "2") == 0) {
++            return 2;
++        }
++#endif
++        return 0;
++    }();
++    return mode;
++}
++
++turbo64_16_stream::~turbo64_16_stream() {
++    for (auto & s : slots) {
++        if (s.pending) {
++            ggml_backend_event_synchronize(s.event.get());
++        }
++    }
++}
++
++bool turbo64_16_stream::init(ggml_backend_t backend) {
++    auto * dev = ggml_backend_get_device(backend);
++    if (attempted) {
++        return device == dev;
++    }
++    attempted = true;
++
++    ggml_backend_dev_props props;
++    ggml_backend_dev_get_props(dev, &props);
++    if (!props.caps.async || !props.caps.host_buffer || !props.caps.events) {
++        return false;
++    }
++    auto * buft = ggml_backend_dev_host_buffer_type(dev);
++    if (!buft) {
++        return false;
++    }
++
++    for (auto & s : slots) {
++        s.buffer.reset(ggml_backend_buft_alloc_buffer(buft, stage_size));
++        s.event.reset(ggml_backend_event_new(dev));
++        if (!s.buffer || !s.event || ggml_backend_buffer_get_type(s.buffer.get()) != buft) {
++            for (auto & allocated : slots) {
++                allocated.event.reset();
++                allocated.buffer.reset();
++            }
++            LLAMA_LOG_WARN("Turbo64-16: staging allocation failed, using prefetch only\n");
++            return false;
++        }
++    }
++    device = dev;
++    LLAMA_LOG_INFO("Turbo64-16: %s expert uploads, 2 x 32 MiB host buffers, 128 MiB read-ahead\n", ggml_backend_name(backend));
++    return true;
++}
++
++bool turbo64_16_stream::copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, const std::vector<bool> & used, int64_t n_tokens) {
++    const int mode = turbo64_16_mode();
++    if (!mode || n_tokens < 32 || !src->data || !ggml_is_contiguous(src) || !ggml_are_same_shape(src, dst) ||
++            std::memcmp(src->nb, dst->nb, sizeof(src->nb)) != 0 ||
++            src->ne[2] <= 0 || src->ne[3] != 1 || used.size() != (size_t) src->ne[2]) {
++        return false;
++    }
++
++    const bool staging = mode == 2 && init(backend);
++    const bool diagnostics = diagnostics_enabled();
++    const int64_t started = diagnostics ? ggml_time_us() : 0;
++    transfer_stats current;
++    const size_t expert_size = src->nb[2];
++    const size_t tensor_size = ggml_nbytes(src);
++
++    for (size_t first = 0; first < used.size();) {
++        if (!used[first]) {
++            ++first;
++            continue;
++        }
++        size_t last = first + 1;
++        while (last < used.size() && used[last]) {
++            ++last;
++        }
++
++        // Preserve the scheduler's MMQ padding at the end of each expert run.
++        const size_t offset = first * expert_size;
++        const size_t padding = last < used.size() ? std::min<size_t>(expert_size, 512) : 0;
++        const size_t length = (last - first) * expert_size + padding;
++        GGML_ASSERT(offset <= tensor_size && length <= tensor_size - offset);
++        if (diagnostics) {
++            current.experts += last - first;
++            current.bytes += length;
++        }
++
++        for (size_t pos = 0; pos < length;) {
++            const size_t window = std::min(prefetch_size, length - pos);
++            int64_t before = diagnostics ? ggml_time_us() : 0;
++            llama_prefetch({{(const uint8_t *) src->data + offset + pos, window}});
++            if (diagnostics) {
++                current.prefetch_us += ggml_time_us() - before;
++            }
++
++            for (size_t chunk = 0; chunk < window;) {
++                const size_t size = std::min(stage_size, window - chunk);
++                const size_t target = offset + pos + chunk;
++                const void * data = (const uint8_t *) src->data + target;
++                if (staging) {
++                    auto & s = slots[next_slot];
++                    if (s.pending) {
++                        before = diagnostics ? ggml_time_us() : 0;
++                        ggml_backend_event_synchronize(s.event.get());
++                        if (diagnostics) {
++                            current.wait_us += ggml_time_us() - before;
++                        }
++                    }
++                    void * host = ggml_backend_buffer_get_base(s.buffer.get());
++                    before = diagnostics ? ggml_time_us() : 0;
++                    std::memcpy(host, data, size);
++                    if (diagnostics) {
++                        current.stage_us += ggml_time_us() - before;
++                    }
++                    before = diagnostics ? ggml_time_us() : 0;
++                    ggml_backend_tensor_set_async(backend, dst, host, target, size);
++                    ggml_backend_event_record(s.event.get(), backend);
++                    s.pending = true;
++                    next_slot = (next_slot + 1) % slots.size();
++                } else {
++                    before = diagnostics ? ggml_time_us() : 0;
++                    ggml_backend_tensor_set_async(backend, dst, data, target, size);
++                }
++                if (diagnostics) {
++                    ++current.chunks;
++                    current.enqueue_us += ggml_time_us() - before;
++                }
++                chunk += size;
++            }
++            pos += window;
++        }
++        first = last;
++    }
++    if (diagnostics) {
++        ++stats.tensors;
++        stats.experts += current.experts;
++        stats.bytes += current.bytes;
++        stats.chunks += current.chunks;
++        stats.prefetch_us += current.prefetch_us;
++        stats.wait_us += current.wait_us;
++        stats.stage_us += current.stage_us;
++        stats.enqueue_us += current.enqueue_us;
++        LLAMA_LOG_INFO("Turbo64-16 expert: tensor=%s type=%s backend=%s tokens=%lld selected=%zu/%zu requested=%.2f MiB pinned=%s chunks=%zu host_ms=%.2f prefetch_ms=%.2f stage_ms=%.2f wait_ms=%.2f enqueue_ms=%.2f\n",
++                src->name, ggml_type_name(src->type), ggml_backend_name(backend), (long long) n_tokens,
++                current.experts, used.size(), current.bytes / 1048576.0, staging ? "yes" : "no", current.chunks,
++                (ggml_time_us() - started) / 1000.0, current.prefetch_us / 1000.0,
++                current.stage_us / 1000.0, current.wait_us / 1000.0, current.enqueue_us / 1000.0);
++    }
++    return true;
++}
+--- /dev/null
++++ b/turbo64-16/test-expert-stream.cpp
+@@ -0,0 +1,79 @@
++#include "expert-stream.h"
++
++#include "ggml-backend.h"
++
++#include <algorithm>
++#include <cstdio>
++#include <cstring>
++#include <vector>
++
++int main() {
++    if (!turbo64_16_mode()) {
++        std::fprintf(stderr, "Set TURBO64_16=1 or 2 before running this test.\n");
++        return 1;
++    }
++    ggml_backend_load_all();
++    auto * dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
++    if (!dev) {
++        std::fprintf(stderr, "A GPU backend is required.\n");
++        return 1;
++    }
++    ggml_backend_ptr backend(ggml_backend_dev_init(dev, nullptr));
++    if (!backend) {
++        return 1;
++    }
++    ggml_init_params params = { 2 * ggml_tensor_overhead(), nullptr, true };
++    for (ggml_type type : { GGML_TYPE_Q2_K, GGML_TYPE_MXFP4 }) {
++        ggml_context_ptr ctx(ggml_init(params));
++        auto * src = ggml_new_tensor_3d(ctx.get(), type, 4096, 2048, 64);
++        auto * dst = ggml_dup_tensor(ctx.get(), src);
++        const size_t size = ggml_nbytes(src);
++        std::vector<uint8_t> source(size);
++        std::vector<uint8_t> expected(size);
++        std::vector<uint8_t> actual(size);
++        for (size_t i = 0; i < size; ++i) {
++            source[i] = (uint8_t) (i * 37 + i / 4096);
++        }
++        src->data = source.data();
++        ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(ctx.get(), backend.get()));
++        if (!buffer) {
++            return 1;
++        }
++
++        for (int pattern = 0; pattern < 5; ++pattern) {
++            std::vector<bool> used(64);
++            for (size_t i = 0; i < used.size(); ++i) {
++                used[i] = pattern == 0 || (pattern == 1 && i % 2 == 0) ||
++                    (pattern == 2 && i >= 11 && i < 54) || (pattern == 3 && i == 63);
++            }
++            std::fill(expected.begin(), expected.end(), 0xcc);
++            ggml_backend_tensor_set(dst, expected.data(), 0, size);
++            for (size_t i = 0; i < used.size(); ++i) {
++                if (used[i]) {
++                    const size_t offset = i * src->nb[2];
++                    const size_t length = src->nb[2] + (i + 1 < used.size() ? 512 : 0);
++                    std::memcpy(expected.data() + offset, source.data() + offset, length);
++                }
++            }
++            {
++                turbo64_16_stream stream;
++                if (stream.copy(backend.get(), src, dst, used, 1)) {
++                    std::fprintf(stderr, "Decode must use the original copy path.\n");
++                    return 1;
++                }
++                // Repeat without synchronizing to exercise event-protected buffer reuse.
++                if (!stream.copy(backend.get(), src, dst, used, 1024) ||
++                        !stream.copy(backend.get(), src, dst, used, 1024)) {
++                    return 1;
++                }
++            }
++            ggml_backend_tensor_get(dst, actual.data(), 0, size);
++            if (actual != expected) {
++                std::fprintf(stderr, "%s pattern %d: byte mismatch\n", ggml_type_name(type), pattern);
++                return 1;
++            }
++            std::printf("%s pattern %d: exact bytes, padding, reuse and destruction passed\n", ggml_type_name(type), pattern);
++        }
++    }
++    return 0;
++}
+--- /dev/null
++++ b/turbo64-16/build.cmd
+@@ -0,0 +1,11 @@
++@echo off
++setlocal
++cd /d "%~dp0.."
++call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat" >nul
++if errorlevel 1 exit /b 1
++set "PATH=C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin;C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja;%PATH%"
++cmake -S . -B build-turbo64-16 -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=89-real -DGGML_NATIVE=ON -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_EXAMPLES=OFF
++if errorlevel 1 exit /b 1
++cmake --build build-turbo64-16 --target llama-server turbo64-16-package llama-bench test-backend-ops test-turbo64-16 test-turbo64-16-private-logs --parallel 8
++if errorlevel 1 exit /b 1
++exit /b 0
+--- /dev/null
++++ b/turbo64-16/run-server.cmd
+@@ -0,0 +1,13 @@
++@echo off
++setlocal
++cd /d "%~dp0.."
++set "TURBO64_16=2"
++if not "%~1"=="" set "TURBO64_16=%~1"
++if not "%TURBO64_16%"=="0" if not "%TURBO64_16%"=="1" if not "%TURBO64_16%"=="2" exit /b 2
++echo Turbo64-16 mode %TURBO64_16%: 0=original, 1=mapped experts and read-ahead, 2=add pinned uploads
++"turbo64-16\bin\llama-server.exe" ^
++ -m "C:\Users\Tudi\Documents\Tudi\AI\MiMo-V2.6-Flash-MOPD-Q2_K-00001-of-00002.gguf" ^
++ --host 0.0.0.0 --port 5559 ^
++ -c 65536 -ngl all --n-cpu-moe 47 ^
++ -t 16 -tb 24 -b 4096 -ub 1024 ^
++ -fa on -lm mmap -np 1 --jinja --reasoning on
+--- /dev/null
++++ b/turbo64-16/benchmark.py
+@@ -0,0 +1,71 @@
++"""Measure uncached prefill on a running llama-server using only Python's standard library."""
++
++import argparse
++import datetime
++import json
++import statistics
++import time
++import urllib.request
++from pathlib import Path
++
++
++def request(url, path, payload=None):
++    data = None if payload is None else json.dumps(payload).encode()
++    req = urllib.request.Request(url.rstrip("/") + path, data=data, headers={"Content-Type": "application/json"})
++    with urllib.request.urlopen(req, timeout=3600) as response:
++        return json.load(response)
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--url", default="http://127.0.0.1:5559")
++    parser.add_argument("--tokens", type=int, default=1024)
++    parser.add_argument("--repetitions", type=int, default=3)
++    parser.add_argument("--generate", type=int, default=16)
++    parser.add_argument("--label", default="turbo2")
++    parser.add_argument("--output", type=Path)
++    args = parser.parse_args()
++    if args.tokens < 32 or args.tokens + args.generate >= 65536 or args.generate < 1 or args.repetitions < 1:
++        parser.error("Use 32 <= tokens, 1 <= generate, tokens + generate < 65536, repetitions >= 1.")
++
++    request(args.url, "/health")
++    report = {
++        "label": args.label,
++        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
++        "server": request(args.url, "/props"),
++        "tokens_requested": args.tokens,
++        "runs": [],
++    }
++    prose = "Explain how memory capacity, disk bandwidth, and transfer latency affect large language model inference. "
++    for index in range(args.repetitions):
++        # Change the start of every prompt so the server cannot reuse a previous KV prefix.
++        prefix = f"Independent benchmark {args.label} {index} {time.time_ns()}. "
++        tokens = request(args.url, "/tokenize", {"content": prefix + prose * args.tokens})["tokens"][:args.tokens]
++        if len(tokens) != args.tokens:
++            raise RuntimeError("Tokenizer returned too few tokens.")
++        started = time.perf_counter()
++        result = request(args.url, "/completion", {
++            "prompt": tokens,
++            "n_predict": args.generate,
++            "temperature": 0,
++            "seed": 1234,
++            "cache_prompt": False,
++            "stream": False,
++        })
++        if result["timings"].get("cache_n", 0) != 0 or result["timings"]["prompt_n"] != args.tokens:
++            raise RuntimeError("The server reused a prompt prefix or processed a different token count; discard this run.")
++        run = {"wall_seconds": time.perf_counter() - started, "timings": result["timings"],
++               "tokens_cached": result.get("tokens_cached")}
++        report["runs"].append(run)
++        print(json.dumps(run), flush=True)
++        output = args.output or Path(__file__).parent / f"results-{args.label}.json"
++        output.write_text(json.dumps(report, indent=2), encoding="utf-8")
++
++    rates = [run["timings"]["prompt_per_second"] for run in report["runs"]]
++    report["median_prompt_tokens_per_second"] = statistics.median(rates)
++    output.write_text(json.dumps(report, indent=2), encoding="utf-8")
++    print(f"Median prefill: {statistics.median(rates):.2f} tokens/s. Saved {output}")
++
++
++if __name__ == "__main__":
++    main()
+--- /dev/null
++++ b/turbo64-16/export_patch.py
+@@ -0,0 +1,47 @@
++"""Export the private source patch without requiring a Git repository."""
++
++import difflib
++import hashlib
++import json
++from pathlib import Path
++
++
++def main():
++    root = Path(__file__).resolve().parent.parent
++    bundle = root / "turbo64-16"
++    hooks = ["src/CMakeLists.txt", "src/llama-context.h", "src/llama-context.cpp", "src/llama-model-loader.cpp", "tools/server/CMakeLists.txt"]
++    hooks += ["common/log.h", "common/log.cpp", "common/chat.cpp", "tools/server/server-context.cpp", "tools/server/server-http.cpp"]
++    additions = [
++        "expert-stream.h", "expert-stream.cpp", "test-expert-stream.cpp",
++        "build.cmd", "run-server.cmd", "benchmark.py", "export_patch.py", "README.md", "RESULTS.md",
++        "CMakeLists.txt", "server-main.cpp", "package-server.cmake",
++        "private-logs.cpp", "private-logs.h", "test-private-logs.cpp",
++    ]
++    hook_diff = []
++    manifest = {}
++    for name in hooks:
++        original = bundle / "original" / name
++        current = root / name
++        hook_diff.extend(difflib.unified_diff(
++            original.read_text(encoding="utf-8").splitlines(keepends=True),
++            current.read_text(encoding="utf-8").splitlines(keepends=True),
++            fromfile="a/" + name, tofile="b/" + name,
++        ))
++        manifest[name] = {
++            "original_sha256": hashlib.sha256(original.read_bytes()).hexdigest(),
++            "patched_sha256": hashlib.sha256(current.read_bytes()).hexdigest(),
++        }
++    (bundle / "source-hooks.patch").write_text("".join(hook_diff), encoding="utf-8", newline="\n")
++    complete = list(hook_diff)
++    for name in additions:
++        complete.extend(difflib.unified_diff(
++            [], (bundle / name).read_text(encoding="utf-8").splitlines(keepends=True),
++            fromfile="/dev/null", tofile="b/turbo64-16/" + name,
++        ))
++    (bundle / "turbo64-16.patch").write_text("".join(complete), encoding="utf-8", newline="\n")
++    (bundle / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
++    print("Exported source-hooks.patch, turbo64-16.patch, and manifest.json")
++
++
++if __name__ == "__main__":
++    main()
+--- /dev/null
++++ b/turbo64-16/README.md
+@@ -0,0 +1,121 @@
++# Turbo64-16
++
++Opt-in Windows optimization for MiMo-V2.6-Flash on Ryzen 7950X, 64 GB RAM, Gen5 NVMe, RTX 4080. Based on the supplied llama.cpp-b11475 source archive. Maintained independently of ggml-org/llama.cpp; no upstream submission is intended.
++
++## Run
++
++From the source directory in Command Prompt:
++
++```bat
++turbo64-16\run-server.cmd 2
++```
++
++This uses the bespoke `turbo64-16\bin\llama-server.exe` and your original model, 64K context, `--n-cpu-moe 47`, 16 decode threads, 24 batch threads, batch 4096, microbatch 1024, Flash Attention, mmap, Jinja, and reasoning. It listens on all IPv4 interfaces (`0.0.0.0:5559`), including LAN. Stop any existing server on that port first. You can also run the bespoke executable without arguments to use the same model profile.
++
++## Connect your app over LAN
++
++The Ethernet LAN address observed on this PC is `192.168.0.234`. Use this OpenAI-compatible base URL:
++
++```text
++http://192.168.0.234:5559/v1
++```
++
++Use `http://127.0.0.1:5559/v1` for an app running on the same PC. Request `GET /v1/models` to obtain the model ID. Chat uses `POST /v1/chat/completions`; streaming uses the usual `stream: true`. No API key is configured by the launcher; an SDK that requires a value can use a placeholder. The LAN IP can change if the router assigns a new address. If Windows asks for network access, allow the executable on your Private network. Firewall settings are not modified by this project.
++
++## Bespoke diagnostics
++
++The dedicated executable prints a TURBO ASCII banner and enables debug verbosity, timestamps, performance counters, slots monitoring, and Prometheus metrics. Every diagnostic launch saves a timestamped log under `turbo64-16/bin/logs/` while also printing diagnostics in the terminal.
++
++Additional Turbo reports include:
++
++- Expert tensor name, quantization format, backend, batch token count, selected/total experts, requested upload bytes, chunk count, and pinned-buffer use.
++- Time in Windows prefetch calls, host memcpy staging, staging-buffer event waits, upload enqueue calls, and total host processing per expert tensor.
++- Per-graph totals for expert matrices, upload bytes, chunks, the same timing categories, submission time, and return status.
++- CPU usage, process working set/private commit/peak working set, system RAM availability/load, cumulative page faults, and logical process read deltas every five seconds.
++- HTTP status and body byte counts, KV allocations, graph splits, placement, and final prompt/generation timings.
++
++API monitoring is available at `http://192.168.0.234:5559/metrics`, `/slots`, and `/props`. These use llama.cpp's existing schemas. OpenAI chat responses retain the existing response format. The new detailed transfer/hardware reports are in the console/log file, not custom JSON fields.
++
++`requested` upload bytes are not measured physical NVMe reads. Prefetch timing is time inside the OS hint, not a measurement of all disk work. Host staging time can include page-fault stalls on mapped weights. Enqueue and graph submission timings do not wait for all GPU work to complete. Page faults include soft faults; logical read deltas are not total physical disk throughput and can exclude mapped-file reads. GPU model/KV/compute allocations still appear in the existing CUDA logs; live dedicated/shared GPU usage should be checked in Task Manager or nvidia-smi.
++
++The bespoke executable enforces metadata-only logging. Prompt/message bodies, responses, reasoning text, tool arguments, final parsed messages, token text/IDs, parser AST dumps, and arbitrary error text are excluded from console and file logs. The policy stays active with `--verbose` and `--log-jsonl` and cannot be disabled through server arguments. Structured content dumps are blocked; JSONL output can still carry technical counters. `--log-prompts-dir` and `--verbose-prompt` are rejected, and the prompt-file writer is disabled even if configured through a preset. Normal API responses still reach your app. Earlier log files are not retroactively scrubbed.
++
++Logging many details can affect benchmark throughput. For performance measurement, disable the extra diagnostic timers and hardware reporter before launch:
++
++```bat
++set TURBO64_16_DIAGNOSTICS=0
++turbo64-16\run-server.cmd 2
++```
++
++The default logger then uses info verbosity. Set `LLAMA_ARG_LOG_VERBOSITY=4` for trace or `5` for debug. Set `LLAMA_ARG_LOG_FILE` to choose another file, or pass `--log-file`. Other native server arguments override the bespoke host/port/logging defaults. When passing your own arguments directly to the executable, include `-m` and the model settings you want; the full MiMo profile is supplied automatically only when no arguments are given.
++
++The environment variable `TURBO64_16` selects the behavior when the process starts:
++
++| Mode | Behavior |
++| --- | --- |
++| 0 or unset | Original source behavior, including normal CPU repacking and startup prefetch |
++| 1 | File-backed CPU expert weights, no whole-model startup prefetch, bounded selected-expert read-ahead |
++| 2 | Mode 1 plus 2 x 32 MiB host staging buffers with event-protected asynchronous GPU uploads |
++
++The custom upload path handles batches of at least 32 tokens. Smaller batches use the original copy callback. Expert placement stays file-backed for the process lifetime, so CPU decode also uses unrepacked experts; decode performance can change. Switching modes requires restarting the server. Host staging does not allocate additional expert caches in VRAM. Backend capability/allocation failure falls back to prefetch-only transfers.
++
++## Measure
++
++With the server running, in another terminal:
++
++```bat
++py turbo64-16\benchmark.py --tokens 1024 --repetitions 3 --generate 32 --label turbo2
++```
++
++Restart with `turbo64-16\run-server.cmd 0` and repeat with `--label original`. Use mode 1 and `--label turbo1` to isolate staging's contribution. Results are written to `turbo64-16\results-<label>.json`. Each prompt has a different prefix and disables caching; the script rejects reused prefixes. It records prompt processing, generation timing, wall time, server properties, and token counts, without saving generated message text. A allocated 64K context with a 1024-token prompt does not measure attention at a filled 64K context.
++
++Repeat the same workload and include both initial and later runs. Windows file caching makes a single result noisy. Do not compare a cached prompt against an uncached one. Report prompt/generation speeds, dedicated/shared GPU memory from Task Manager, RAM use, and whether normal chat output looks correct. Do not run stock and Turbo simultaneously.
++
++If testing larger prompts, try changing `-ub 1024` to `-ub 2048` and then `-ub 4096` in the launcher, keeping `-b 4096`. Larger microbatches amortize expert reads across more tokens but need more compute memory. These values are experiments, not validated defaults. Stop increasing the microbatch if shared GPU memory appears or performance drops.
++
++## Architecture and approach
++
++The local GGUF metadata confirms 48 layers, hidden size 4096, 256 routed experts with 8 selected per token, expert width 2048, a 128-token sliding window, 39 sliding-window layers and 9 global-attention layers. The first layer has a dense FFN. The two GGUF files total 126,214,594,144 bytes (117.55 GiB); expert tensors alone total 111.625 GiB. Gate/up experts use Q2_K, down experts use MXFP4. The file name does not imply every tensor is Q2_K.
++
++On this machine, CPU expert repacking can allocate anonymous copies of mapped weights. Retaining ordinary CPU buffers lets weights remain file-backed and lets the existing scheduler offload supported prefill matmuls to CUDA. Decode still runs through the normal scheduler. This removes an expert-weight duplication path; it does not make the entire model fit in RAM or eliminate disk reads.
++
++The existing selected-expert copy callback supplies actual routing IDs. Turbo coalesces consecutive selected experts, preserves the original MMQ padding, prefetches at most 128 MiB per window using the existing Windows helper, and uploads chunks of at most 32 MiB. Two pinned host buffers let the host prepare the next chunk while a previous transfer completes. Events prevent overwriting a buffer still in use by the GPU; destruction waits for pending transfers. There is no speculative routing, cross-layer GPU compute/copy pipeline, persistent GPU expert cache, model rewriting, or quantization change.
++
++Sources:
++
++- [Xiaomi MiMo-V2.6-Flash-MOPD model architecture](https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Flash-MOPD)
++- [Official model configuration](https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Flash-MOPD/raw/main/config.json)
++- [Microsoft PrefetchVirtualMemory documentation](https://learn.microsoft.com/en-us/windows/win32/api/memoryapi/nf-memoryapi-prefetchvirtualmemory)
++- [NVIDIA transfer synchronization behavior](https://docs.nvidia.com/cuda/cuda-runtime-api/api-sync-behavior.html)
++- [Existing llama.cpp offloaded-MoE transfer discussion](https://github.com/ggml-org/llama.cpp/issues/25859)
++- [Existing CPU_REPACK allocation report](https://github.com/ggml-org/llama.cpp/issues/23603)
++
++## Build and validate
++
++```bat
++turbo64-16\build.cmd
++set TURBO64_16=2
++build-turbo64-16\bin\test-turbo64-16.exe
++set TURBO64_16=1
++build-turbo64-16\bin\test-turbo64-16.exe
++build-turbo64-16\bin\test-backend-ops.exe test -b CUDA0 -o MUL_MAT_ID -p "type_a=(q2_K|mxfp4)"
++build-turbo64-16\bin\test-turbo64-16-private-logs.exe turbo64-16\private-log-regression.jsonl
++```
++
++The build script uses installed MSVC 2022 Build Tools, Ninja/CMake, CUDA from PATH, Release, native CPU instructions, and GPU architecture 89. It builds server, the bespoke server, bench, and validation tools. The bespoke executable and project DLLs are copied into turbo64-16/bin/. Do not build while either server is running: Windows locks loaded DLLs. The server UI uses llama.cpp's existing asset provisioning, which may download UI assets during the first build. Model inference and benchmarks are local.
++
++The transfer test covers exact bytes for both expert formats, dense/sparse/contiguous/final/empty expert selections, 128 MiB window boundaries, 32 MiB chunks, padding, buffer reuse, destruction with pending transfers, and the single-token fallback. The existing backend tests compare CUDA expert matmuls against CPU. Full-model perplexity and deterministic token equivalence have not been established; CPU/CUDA computation can differ numerically.
++
++The private-log regression runs at maximum verbosity with JSONL enabled and forces chat parser debug mode. It checks that message canaries, token traces, structured payloads, and parser dumps never reach exported logs while hardware, graph, HTTP, and prompt timing counters still appear. It also verifies that parsing still returns the message to the caller.
++
++## Update or remove
++
++Ten existing source files have small hooks: the original four under `src/`, the build hook in `tools/server/CMakeLists.txt`, logging hooks in `common/log.h` and `common/log.cpp`, the parser-debug guard in `common/chat.cpp`, and guards in `tools/server/server-context.cpp` and `tools/server/server-http.cpp`. The Turbo implementation, private logging policy, tests, launch/build/benchmark scripts, documentation, and patch bundle live in `turbo64-16/`. No ggml kernels, public llama API, or MiMo graph files are modified.
++
++Original copies are under `turbo64-16/original/` with their source paths preserved. `source-hooks.patch` contains just the small upstream hooks; `turbo64-16.patch` also includes the new standalone files.
++
++For a fresh llama.cpp source tree, use `git -c core.autocrlf=false apply --check <path-to-turbo64-16.patch>` and then `git -c core.autocrlf=false apply <path-to-turbo64-16.patch>` from that tree. `git apply` also works on source archives without a Git repository. Rebuild with the included script. If an update changes the callback or loader interfaces, inspect the rejected hunk instead of force-applying it. The patches are validated against this archive only.
++
++To remove the changes from this tree, stop the server and use `git -c core.autocrlf=false apply --reverse --check turbo64-16/source-hooks.patch` followed by `git -c core.autocrlf=false apply --reverse turbo64-16/source-hooks.patch`. This removes the source hooks and leaves artifacts for inspection. Check first because reversing must not overwrite later edits. Alternatively, run mode 0 to disable the optimization without editing files.
++
++Measured results and limitations are recorded in `RESULTS.md`.
+--- /dev/null
++++ b/turbo64-16/RESULTS.md
+@@ -0,0 +1,68 @@
++# Local validation results
++
++Date: 2026-10-07. Windows 11, Ryzen 7950X, 64 GB RAM, RTX 4080, driver 610.74. Supplied source: llama.cpp-b11475 archive, no Git metadata. Release build: MSVC 19.44.35228, CUDA 12.8, sm_89, native CPU instructions.
++
++## Full server configuration
++
++Mode 2, same model and user settings: context 65536, GPU layers all, CPU MoE 47, decode threads 16, batch threads 24, batch 4096, microbatch 1024, Flash Attention on, mmap, one slot, Jinja, reasoning on. Validation used loopback port 5558 and disabled startup warmup. User launcher uses the original port 5559 and default warmup behavior.
++
++Each request had 1024 input tokens with `cache_n=0`. The prompt was repeated inference-related prose through `/completion`, not a chat-template quality evaluation.
++
++| Run | Prompt tokens | Prefill | Generation | Prompt time |
++| --- | ---: | ---: | ---: | ---: |
++| First | 1024 | 20.56 tokens/s | 1.74 tokens/s, 8 predicted tokens | 49.80 s |
++| Repeat | 1024 | 18.44 tokens/s | 2.18 tokens/s, 32 predicted tokens | 55.53 s |
++
++Observed total dedicated device usage from nvidia-smi: approximately 13,108-13,114 MiB (12.8 GiB), including desktop applications. This is not a per-process measurement. Task Manager shared GPU memory was not measured. Process working set reached approximately 54 GiB, including file-backed pages; this is not an extra 54 GiB allocation on top of file caching.
++
++Raw results: `results-turbo2-64k.json`, `results-turbo2-64k-repeat.json`, `benchmark-64k.log`, `benchmark-64k-repeat.log`, `server-test.stderr.log`.
++
++User-reported previous stock result: 8.35 tokens/s prefill and 3.83 tokens/s generation. Turbo's observed prefill is 2.21-2.46 times that number, but the original prompt, cache state, run length, and binary were not reproduced. This is a comparison to a reported reference, not a controlled speedup claim. The generation numbers are lower and need matched A/B testing before deciding whether this tradeoff is useful.
++
++The 64K KV allocation was tested; attention with 64K populated tokens was not. Larger microbatches, mode 1 versus mode 2, cold versus warm disk behavior, and normal chat output remain for user testing. No claim is made that staging independently accounts for the improvement: retaining file-backed experts and changing the scheduler's prefill placement are substantial parts of the patch.
++
++## Short bench sanity check
++
++Available stock binary: b11447, CUDA 12.4, dynamic zen4 CPU backend. Local patched binary: b11475, CUDA 12.8, MSVC native CPU backend. Both used pp128, no warmup, one repetition, GPU layers 99, CPU MoE 47, threads 24, batch 4096, microbatch 1024, Flash Attention, mmap.
++
++| Binary | pp128 |
++| --- | ---: |
++| Available stock b11447 | 1.696 tokens/s |
++| Turbo64-16 mode 2 | 3.845 tokens/s |
++
++These are different source/compiler configurations and sequential runs with uncontrolled file caching. They are sanity checks, not a rigorous performance comparison, and llama-bench did not allocate the server's full 64K context. Raw output: `stock-pp128.json`, `turbo-pp128.json`.
++
++## Correctness and build
++
++- Release build passed for llama-server, llama-bench, test-backend-ops, and test-turbo64-16.
++- Mode 1 transfer validation: 10/10 Q2_K/MXFP4 selection cases passed byte-exactly.
++- Mode 2 transfer validation: 10/10 Q2_K/MXFP4 selection cases passed byte-exactly.
++- CUDA MUL_MAT_ID versus CPU: 77/77 selected tests passed. Existing tests' numerical tolerances apply.
++- Windows PrefetchVirtualMemory support is present in the built binary.
++- Python scripts compile; patch replay and reversal are checked against the supplied originals.
++
++This does not establish full-model perplexity or token-identical generation. The patch preserves selected experts, weight bytes and padding, but changing CPU/CUDA execution can change floating-point rounding.
++
++Mode 0 preserves the original source behavior in the same compiled binary and is the preferred next A/B baseline. See README.md for launch and measurement commands.
++
++## Bespoke LAN server validation
++
++The dedicated executable is `turbo64-16/bin/llama-server.exe`; the original server entry point is retained separately under `build-turbo64-16/bin/`. The dedicated main adds the TURBO banner and defaults for debug logs, timestamps, metrics, slots, performance reporting, and a five-second Windows hardware reporter. Expert transfer/graph timers are enabled by `TURBO64_16_DIAGNOSTICS=1` and are off unless requested in other tools.
++
++The LAN listener was verified at `0.0.0.0:5559`. Access through the PC's Ethernet address `192.168.0.234:5559` returned HTTP 200 for `/health`, `/v1/models`, `/props`, `/slots`, and `/metrics`, and an OpenAI-compatible `/v1/chat/completions` request returned an assistant message with normal usage fields. The metrics output included Prometheus type declarations. This test originated on the server PC via its LAN IP; access from another LAN device and Windows Firewall allowance were not tested or modified.
++
++Mode 2's byte-exact transfer tests also passed with diagnostic timing enabled. Console and saved-file hardware reports were observed. Raw evidence: `api-smoke.json`, `api-smoke-check.log`, `api-smoke.stderr.log`, `server-version.log`, `test-stream-diagnostics.log`, and files under `bin/logs/`. The banner and API schema checks do not require repeating GPU kernel correctness tests because no kernels or response serializers were changed.
++
++Diagnostics add logging overhead. The prefill figures above were measured before enabling debug logging and hardware reporting.
++
++An uncached 128-token native completion additionally exercised the instrumented GPU expert path: the main 124-token graph reported 138 expert tensors, 18,330 selected matrices, 58,049.19 MiB requested uploads, and 8,720 chunks. Measured host categories were 7,662.88 ms prefetch calls, 27,504.50 ms staging (including possible page-fault stalls), 400.89 ms staging-buffer waits, and 137.90 ms enqueue calls. This demonstrates actual counters on the model; these are not physical disk/GPU-bandwidth measurements. Raw evidence: `results-diagnostics-pp128.json` and `diagnostics-prefill-check.log`.
++
++## Content-free logging update
++
++The bespoke executable now installs a one-way metadata-only logging filter before server initialization. Unapproved log formats are dropped before log formatting/queueing; preformatted backend records use an explicit list of technical producers. Structured content dumps are disabled, chat parser debug output is suppressed, and the prompt-file writer is blocked. Verbosity and JSONL settings cannot remove this policy. The benchmark helper no longer saves generated text.
++
++The dedicated regression passed at maximum verbosity with JSONL and parser debugging requested. Synthetic message canaries were absent from both console and file output; hardware, graph, HTTP status/size, and prompt timing counters remained. Prompt-file capture arguments were rejected before creating a directory. Evidence: `private-log-regression.console.log`, `private-log-regression.jsonl`, and `private-prompt-option.log`.
++
++An API check using the real model passed for normal chat (HTTP 200), streaming chat (HTTP 200 with completed SSE), and malformed JSON (HTTP 400). With `--verbose --log-jsonl`, request canaries and generated message/reasoning text were absent from terminal captures and the saved log. Hardware, HTTP metadata, and prompt timing records remained. The test report stores status codes and token usage only, without chat contents: `privacy-api-check.json`.
++
++Earlier API smoke tests and older log/result files described above predate this policy and have not been scrubbed. The updated policy applies to the bespoke executable, including Turbo mode 0. Other binaries retain their normal logging unless they explicitly install a metadata-only filter.
+--- /dev/null
++++ b/turbo64-16/CMakeLists.txt
+@@ -0,0 +1,20 @@
++add_executable(turbo64-16-server server-main.cpp private-logs.cpp)
++target_link_libraries(turbo64-16-server PRIVATE llama-server-impl)
++target_compile_features(turbo64-16-server PRIVATE cxx_std_17)
++if (LLAMA_BUILD_TESTS)
++    add_executable(test-turbo64-16-private-logs test-private-logs.cpp private-logs.cpp)
++    target_link_libraries(test-turbo64-16-private-logs PRIVATE llama-common)
++    target_compile_features(test-turbo64-16-private-logs PRIVATE cxx_std_17)
++endif()
++if (WIN32)
++    target_link_libraries(turbo64-16-server PRIVATE psapi)
++endif()
++set(TURBO64_16_PACKAGE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/bin" CACHE PATH "Turbo64-16 server package directory")
++add_custom_target(turbo64-16-package ALL
++    COMMAND ${CMAKE_COMMAND}
++        "-DSERVER=$<TARGET_FILE:turbo64-16-server>"
++        "-DBINARY_DIR=$<TARGET_FILE_DIR:turbo64-16-server>"
++        "-DDESTINATION=${TURBO64_16_PACKAGE_DIR}"
++        -P ${CMAKE_CURRENT_SOURCE_DIR}/package-server.cmake
++    DEPENDS turbo64-16-server
++    VERBATIM)
+--- /dev/null
++++ b/turbo64-16/server-main.cpp
+@@ -0,0 +1,179 @@
++#include "log.h"
++#include "private-logs.h"
++
++#include <algorithm>
++#include <chrono>
++#include <condition_variable>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <filesystem>
++#include <mutex>
++#include <string>
++#include <thread>
++#include <vector>
++
++#ifdef _WIN32
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#include <windows.h>
++#include <psapi.h>
++#endif
++
++int llama_server(int argc, char ** argv);
++
++static void set_default(const char * name, const char * value) {
++    if (!std::getenv(name)) {
++#ifdef _WIN32
++        _putenv_s(name, value);
++#else
++        setenv(name, value, 0);
++#endif
++    }
++}
++
++static void print_banner() {
++    std::fputs(R"(
++  _______  _   _  ____   ____    ___
++ |__   __|| | | ||  _ \ |  _ \  / _ \
++    | |   | | | || |_) || |_) || | | |
++    | |   | |_| ||  _ < |  _ < | |_| |
++    |_|    \___/ |_| \_\|____/  \___/
++
++ +------------------------------------------------------+
++ | TURBO64-16 // PRIVATE LAN INFERENCE SERVER            |
++ | Ryzen 7950X | 64 GB DDR5 | NVMe | RTX 4080             |
++ | Mapped experts -> bounded read-ahead -> pinned upload |
++ +------------------------------------------------------+
++)", stderr);
++    std::fflush(stderr);
++}
++
++struct hardware_monitor {
++    std::mutex mutex;
++    std::condition_variable wake;
++    bool stopped = false;
++    std::thread worker;
++
++    explicit hardware_monitor(bool enabled) {
++#ifdef _WIN32
++        if (!enabled) {
++            return;
++        }
++        worker = std::thread([this] {
++            uint64_t cpu_previous = 0;
++            uint64_t read_previous = 0;
++            auto time_previous = std::chrono::steady_clock::now();
++            const double processors = std::max(1u, std::thread::hardware_concurrency());
++            std::unique_lock<std::mutex> lock(mutex);
++            while (!stopped) {
++                PROCESS_MEMORY_COUNTERS_EX process = {};
++                MEMORYSTATUSEX system = {};
++                system.dwLength = sizeof(system);
++                FILETIME creation, exit, kernel, user;
++                IO_COUNTERS io = {};
++                if (GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *) &process, sizeof(process)) &&
++                        GlobalMemoryStatusEx(&system) && GetProcessTimes(GetCurrentProcess(), &creation, &exit, &kernel, &user) &&
++                        GetProcessIoCounters(GetCurrentProcess(), &io)) {
++                    const uint64_t cpu = ((uint64_t) kernel.dwHighDateTime << 32) + kernel.dwLowDateTime +
++                                         ((uint64_t) user.dwHighDateTime << 32) + user.dwLowDateTime;
++                    const auto now = std::chrono::steady_clock::now();
++                    const double seconds = std::chrono::duration<double>(now - time_previous).count();
++                    const double usage = cpu_previous && seconds > 0 ? (cpu - cpu_previous) / 1e7 / seconds / processors * 100 : 0;
++                    LOG_INF("Turbo64-16 hardware: cpu=%.1f%% working_set=%.2f GiB private_commit=%.2f GiB peak_working_set=%.2f GiB system_ram_free=%.2f/%.2f GiB ram_load=%lu%% page_faults=%lu logical_read_delta=%.1f MiB\n",
++                            usage, process.WorkingSetSize / 1073741824.0, process.PrivateUsage / 1073741824.0,
++                            process.PeakWorkingSetSize / 1073741824.0, system.ullAvailPhys / 1073741824.0,
++                            system.ullTotalPhys / 1073741824.0, system.dwMemoryLoad, process.PageFaultCount,
++                            read_previous ? (io.ReadTransferCount - read_previous) / 1048576.0 : 0);
++                    cpu_previous = cpu;
++                    read_previous = io.ReadTransferCount;
++                    time_previous = now;
++                }
++                wake.wait_for(lock, std::chrono::seconds(5), [this] { return stopped; });
++            }
++        });
++#else
++        (void) enabled;
++#endif
++    }
++
++    ~hardware_monitor() {
++        {
++            std::lock_guard<std::mutex> lock(mutex);
++            stopped = true;
++        }
++        wake.notify_all();
++        if (worker.joinable()) {
++            worker.join();
++        }
++        common_log_flush(common_log_main());
++    }
++};
++
++int main(int argc, char ** argv) {
++    common_log_set_metadata_only(turbo64_16_metadata_log);
++    for (int i = 1; i < argc; ++i) {
++        std::string option = argv[i];
++        std::replace(option.begin(), option.end(), '_', '-');
++        if (option == "--log-prompts-dir" || option == "--verbose-prompt") {
++            std::fputs("Turbo64-16: conversation-content capture options are disabled.\n", stderr);
++            return 2;
++        }
++    }
++    print_banner();
++    set_default("TURBO64_16", "2");
++    set_default("TURBO64_16_DIAGNOSTICS", "1");
++    const bool diagnostics = std::strcmp(std::getenv("TURBO64_16_DIAGNOSTICS"), "1") == 0;
++    set_default("LLAMA_ARG_HOST", "0.0.0.0");
++    set_default("LLAMA_ARG_PORT", "5559");
++    set_default("LLAMA_ARG_LOG_VERBOSITY", diagnostics ? "5" : "3");
++    set_default("LLAMA_ARG_LOG_PREFIX", "1");
++    set_default("LLAMA_ARG_LOG_TIMESTAMPS", "1");
++    set_default("LLAMA_ARG_ENDPOINT_METRICS", "1");
++    set_default("LLAMA_ARG_ENDPOINT_SLOTS", "1");
++    set_default("LLAMA_ARG_PERF", "1");
++
++    bool information = false;
++    for (int i = 1; i < argc; ++i) {
++        information |= std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0 ||
++                       std::strcmp(argv[i], "--version") == 0 || std::strcmp(argv[i], "--list-devices") == 0;
++    }
++    if (!information && diagnostics && !std::getenv("LLAMA_ARG_LOG_FILE")) {
++        std::error_code error;
++        const auto directory = std::filesystem::absolute(argv[0]).parent_path() / "logs";
++        std::filesystem::create_directories(directory, error);
++        if (!error) {
++            const auto stamp = std::chrono::system_clock::now().time_since_epoch().count();
++            const auto file = (directory / ("turbo-" + std::to_string(stamp) + ".log")).string();
++            set_default("LLAMA_ARG_LOG_FILE", file.c_str());
++            std::fprintf(stderr, "Turbo64-16 diagnostic log: %s\n", file.c_str());
++        }
++    }
++
++    std::vector<std::string> arguments;
++    if (argc == 1) {
++        arguments = {argv[0], "-m", "C:/Users/Tudi/Documents/Tudi/AI/MiMo-V2.6-Flash-MOPD-Q2_K-00001-of-00002.gguf",
++                     "-c", "65536", "-ngl", "all", "--n-cpu-moe", "47", "-t", "16", "-tb", "24",
++                     "-b", "4096", "-ub", "1024", "-fa", "on", "-lm", "mmap", "-np", "1", "--jinja", "--reasoning", "on"};
++    } else {
++        for (int i = 0; i < argc; ++i) {
++            arguments.emplace_back(argv[i]);
++        }
++    }
++    std::vector<char *> pointers;
++    for (auto & argument : arguments) {
++        pointers.push_back(argument.data());
++    }
++    pointers.push_back(nullptr);
++    if (!information) {
++        std::fprintf(stderr, "Turbo mode=%s diagnostics=%s | OpenAI API: http://<PC-LAN-IP>:5559/v1 (default bind)\n",
++                     std::getenv("TURBO64_16"), diagnostics ? "on" : "off");
++        std::fputs("Monitoring: GET /metrics, GET /slots, GET /props | CLI arguments override server defaults.\n", stderr);
++    }
++    hardware_monitor monitor(diagnostics && !information);
++    return llama_server((int) arguments.size(), pointers.data());
++}
+--- /dev/null
++++ b/turbo64-16/package-server.cmake
+@@ -0,0 +1,6 @@
++file(MAKE_DIRECTORY "${DESTINATION}")
++configure_file("${SERVER}" "${DESTINATION}/llama-server.exe" COPYONLY)
++file(GLOB RUNTIME_DLLS "${BINARY_DIR}/*.dll")
++foreach(DLL IN LISTS RUNTIME_DLLS)
++    file(COPY "${DLL}" DESTINATION "${DESTINATION}")
++endforeach()
+--- /dev/null
++++ b/turbo64-16/private-logs.cpp
+@@ -0,0 +1,78 @@
++#include "private-logs.h"
++
++#include <cstring>
++
++static bool starts_with(const char * text, const char * prefix) {
++    return std::strncmp(text, prefix, std::strlen(prefix)) == 0;
++}
++
++bool turbo64_16_metadata_log(const char * message, bool formatted) {
++    const char * turbo_records[] = {
++        "Turbo64-16 hardware:", "Turbo64-16 expert:", "Turbo64-16 graph:",
++        "Turbo64-16: whole-model mmap prefetch disabled", "Turbo64-16: staging allocation failed",
++        "Turbo64-16: %s expert uploads", "Turbo64-16: CUDA",
++    };
++    for (const char * prefix : turbo_records) {
++        if (starts_with(message, prefix)) {
++            return true;
++        }
++    }
++
++    if (formatted) {
++        const char * backend_records[] = {
++            "ggml_cuda_init:", "  Device ", "load_tensors:", "sched_reserve:",
++            "llama_context:", "llama_kv_cache:", "llama_kv_cache_iswa:",
++            "llama_perf_context_print:", "llama_perf_sampler_print:",
++        };
++        for (const char * prefix : backend_records) {
++            if (starts_with(message, prefix)) {
++                return true;
++            }
++        }
++        return false;
++    }
++
++    const char * function_prefixes[] = {
++        "srv  %12.*s: ", "slot %12.*s: id %2d | task %d | ", "%s: ",
++    };
++    for (const char * prefix : function_prefixes) {
++        if (starts_with(message, prefix)) {
++            message += std::strlen(prefix);
++            break;
++        }
++    }
++    while (*message == ' ') {
++        ++message;
++    }
++    const char * counters[] = {
++        "HTTP metadata:", "prompt processing, n_tokens =", "prompt eval time =",
++        "eval time =", "total time =", "load time =", "sampling time =", "samplers time =",
++        "unaccounted time =", "graphs reused =", "n_gen = %6d, tg =", "n_batch (effective) =",
++        "created context checkpoint ",
++    };
++    bool counter = false;
++    for (const char * prefix : counters) {
++        counter |= starts_with(message, prefix);
++    }
++    if (!counter) {
++        return false;
++    }
++
++    // Counters may interpolate numbers, but never text or individual token characters.
++    for (const char * p = message; *p; ++p) {
++        if (*p != '%') {
++            continue;
++        }
++        ++p;
++        if (*p == '%') {
++            continue;
++        }
++        while (*p && std::strchr("-+ #0.123456789*hljztLI", *p)) {
++            ++p;
++        }
++        if (!*p || !std::strchr("diuoxXaAeEfFgGp", *p)) {
++            return false;
++        }
++    }
++    return true;
++}
+--- /dev/null
++++ b/turbo64-16/private-logs.h
+@@ -0,0 +1,3 @@
++#pragma once
++
++bool turbo64_16_metadata_log(const char * message, bool formatted);
+--- /dev/null
++++ b/turbo64-16/test-private-logs.cpp
+@@ -0,0 +1,60 @@
++#include "private-logs.h"
++
++#include "chat.h"
++#include "json.h"
++#include "log.h"
++
++#include <climits>
++#include <cstdio>
++#include <fstream>
++#include <iterator>
++#include <string>
++
++int main(int argc, char ** argv) {
++    if (argc != 2) {
++        return 1;
++    }
++    const std::string marker = "TURBO_PRIVATE_CONTENT_CANARY_73d6";
++    if (common_log_is_metadata_only()) {
++        return 1;
++    }
++    common_log_set_metadata_only(turbo64_16_metadata_log);
++    common_log_set_verbosity_thold(INT_MAX);
++    common_log_set_file(common_log_main(), argv[1]);
++
++    LOG_DBG("Parsed message: %s\n", marker.c_str());
++    LOG_DBG("srv  %12.*s: request: %s\n", 12, __func__, marker.c_str());
++    LOG_DBG("srv  %12.*s: response: %s\n", 12, __func__, marker.c_str());
++    LOG_WRN("%s: unparsed output: %s\n", __func__, marker.c_str());
++    LOG_ERR("%s: error: %s\n", __func__, marker.c_str());
++    LOG_DBG("%s: prefill token: %d = %s\n", __func__, 42, marker.c_str());
++    LOG_DBG("slot %12.*s: id %2d | task %d | slot decode token, id=%d\n", 12, __func__, 0, 1, 42);
++    common_log_default_callback(GGML_LOG_LEVEL_ERROR, marker.c_str(), nullptr);
++    common_log_set_jsonl(true);
++    common_log_add_json(common_log_main(), "request", common_json{{"content", marker}});
++    LOG_INF("Turbo64-16 hardware: cpu=%.1f%%\n", 1.0);
++    LOG_TRC("srv  %12.*s: HTTP metadata: status=%d request_bytes=%zu response_bytes=%zu\n", 12, __func__, 200, size_t(10), size_t(20));
++    LOG_INF("slot %12.*s: id %2d | task %d | prompt eval time = %.2f ms / %d tokens\n", 12, __func__, 0, 1, 10.0, 32);
++    common_log_default_callback(GGML_LOG_LEVEL_INFO, "Turbo64-16 graph: status=0 expert_tensors=138\n", nullptr);
++    LOG_INF("slot %12.*s: id %2d | task %d | prompt eval time = %s\n", 12, __func__, 0, 1, marker.c_str());
++
++    common_chat_parser_params params;
++    params.debug = true;
++    const auto msg = common_chat_peg_parse(common_peg_arena{}, marker, false, params);
++    if (msg.content != marker) {
++        return 1;
++    }
++    common_log_flush(common_log_main());
++    common_log_set_file(common_log_main(), nullptr);
++    std::ifstream file(argv[1]);
++    const std::string contents((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
++    if (contents.find(marker) != std::string::npos || contents.find("Parsed message") != std::string::npos ||
++            contents.find("slot decode token") != std::string::npos || contents.find("Turbo64-16 hardware") == std::string::npos ||
++            contents.find("prompt eval time") == std::string::npos || contents.find("Turbo64-16 graph") == std::string::npos ||
++            contents.find("HTTP metadata:") == std::string::npos) {
++        std::fputs("FAIL: private logging policy\n", stderr);
++        return 1;
++    }
++    std::puts("PASS: content, token traces, parser AST and structured dumps blocked; technical counters retained.");
++    return 0;
++}

@@ -1,0 +1,6 @@
+file(MAKE_DIRECTORY "${DESTINATION}")
+configure_file("${SERVER}" "${DESTINATION}/llama-server.exe" COPYONLY)
+file(GLOB RUNTIME_DLLS "${BINARY_DIR}/*.dll")
+foreach(DLL IN LISTS RUNTIME_DLLS)
+    file(COPY "${DLL}" DESTINATION "${DESTINATION}")
+endforeach()

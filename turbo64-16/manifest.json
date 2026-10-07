@@ -1,0 +1,42 @@
+{
+  "src/CMakeLists.txt": {
+    "original_sha256": "6602fed62f13557db0888ccf2fc69b5c49a01f1eea56a9a0c866e8e60084d5d2",
+    "patched_sha256": "8d4d770c1b5837aefd6806e204f3f5ba2577c5464db1e425a69beee3e7547a91"
+  },
+  "src/llama-context.h": {
+    "original_sha256": "e4678dbb3176d342037aa745dbd6e4128e3280bfc31aad6a5d55e2443cc95ec1",
+    "patched_sha256": "8c7d3e36e96b5443ac8ee2d195f471e00cf23255aed1c73c43559ca4cd9866c0"
+  },
+  "src/llama-context.cpp": {
+    "original_sha256": "c00780a3ab90e444a3d04178e948156a10cd0886c0796248e4ed7fb0936dcabe",
+    "patched_sha256": "aa069ddabc59a28051f55fd9cb7e97b86863458218e4cf75015ec6cd8f727b0a"
+  },
+  "src/llama-model-loader.cpp": {
+    "original_sha256": "301f8250eef5b34d14617c7c9bf5c14bb60519d199751f4d829502a5107f0593",
+    "patched_sha256": "05d18c4be2d7007e72fb05c969ed930af23c935eebdfffb5ef6a391afc5b3dfb"
+  },
+  "tools/server/CMakeLists.txt": {
+    "original_sha256": "553ce6725d470274a6bb2b120da87b5328497a1a6c760ae8a5510c7277e05180",
+    "patched_sha256": "6dd6e24b7bc70b6b71a81f881da9a395065aa8e23d1d9ac4682bb78c7ad6345d"
+  },
+  "common/log.h": {
+    "original_sha256": "f84dcd0519a8ec2b527d9bd9c39d5f4757d7ff5b2ba8e4d10c7ab8b9154be88b",
+    "patched_sha256": "9bdc53e1056668174dadffa98dad7a9107569f4d22f75e85eb82a7172568491f"
+  },
+  "common/log.cpp": {
+    "original_sha256": "a5c1edc4c446a406233b803a935438f1064201764ec8bb515dc91a16619a3b1b",
+    "patched_sha256": "66fa077d4a6a152080c497a3ad9be35037bf26ad23341c55d2a2b9ca678dff0c"
+  },
+  "common/chat.cpp": {
+    "original_sha256": "0ac2118a35e68280c8440d34e1622f05df455c08360e27af8cbf437489b5dd48",
+    "patched_sha256": "87b3aa96e044a648d1cb4d34ae847046643fab3999508c42f07128d4139d8d8a"
+  },
+  "tools/server/server-context.cpp": {
+    "original_sha256": "7309e8b68c686ba1cf8f3b907d9b79587e2b714e58e37b04b259a781d6469930",
+    "patched_sha256": "4e3f5bc6a68e175589d94f8fbb951c762b38ef1bf50a56dd17cbb9ea57f37d2a"
+  },
+  "tools/server/server-http.cpp": {
+    "original_sha256": "24ede172e526763567dbe929da5b16250693d7a2e44334ef0126649b6d3f5fdb",
+    "patched_sha256": "081cc6685c54ca0038eb8abcc150836a72f99ebe8669a21724733d9a5f1b4891"
+  }
+}

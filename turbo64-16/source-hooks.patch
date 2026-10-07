@@ -1,0 +1,273 @@
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -15,6 +15,7 @@
+     llama-batch.cpp
+     llama-chat.cpp
+     llama-context.cpp
++    ../turbo64-16/expert-stream.cpp
+     llama-cparams.cpp
+     llama-grammar.cpp
+     llama-graph.cpp
+@@ -64,11 +65,22 @@
+ 
+ configure_file(llama-version.h.in ${CMAKE_CURRENT_BINARY_DIR}/llama-version.h @ONLY)
+ 
+-target_include_directories(llama PRIVATE . ${CMAKE_CURRENT_BINARY_DIR})
++target_include_directories(llama PRIVATE . ${CMAKE_CURRENT_BINARY_DIR} ../turbo64-16)
+ target_include_directories(llama PUBLIC ../include)
+ target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
+ 
+ target_link_libraries(llama PUBLIC ggml)
++
++if (LLAMA_BUILD_TESTS)
++    add_executable(test-turbo64-16
++        ../turbo64-16/test-expert-stream.cpp
++        ../turbo64-16/expert-stream.cpp
++        llama-mmap.cpp
++        llama-impl.cpp)
++    target_include_directories(test-turbo64-16 PRIVATE . ../include ../turbo64-16)
++    target_compile_features(test-turbo64-16 PRIVATE cxx_std_17)
++    target_link_libraries(test-turbo64-16 PRIVATE ggml)
++endif()
+ 
+ if (BUILD_SHARED_LIBS)
+     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -10,6 +10,7 @@
+ 
+ #include "ggml-cpp.h"
+ #include "ggml-opt.h"
++#include "expert-stream.h"
+ 
+ #include <array>
+ #include <map>
+@@ -376,6 +377,7 @@
+ 
+     ggml_backend_t backend_cpu = nullptr;
+     std::vector<ggml_backend_ptr> backends;
++    turbo64_16_stream expert_stream;
+ 
+     // training
+     ggml_opt_context_t opt_ctx = nullptr;
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -2633,8 +2633,10 @@
+     }
+ 
+     copy_experts.reset();
++    expert_stream.begin_graph();
+ 
+     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
++    expert_stream.end_graph(status);
+     if (status != GGML_STATUS_SUCCESS) {
+         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
+     }
+@@ -2645,7 +2647,8 @@
+ }
+ 
+ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data) {
+-    auto & st = static_cast<llama_context *>(user_data)->copy_experts;
++    auto & ctx = *static_cast<llama_context *>(user_data);
++    auto & st = ctx.copy_experts;
+ 
+     // the ids must be computed before the split starts, so only the first node of the split is considered
+     if (ggml_graph_n_nodes(graph) == 0) {
+@@ -2679,6 +2682,10 @@
+         }
+ 
+         st.ids = ids;
++    }
++
++    if (ctx.expert_stream.copy(backend, src, dst, st.used, ids->ne[1])) {
++        return true;
+     }
+ 
+     // group consecutive experts and copy them together
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -5,6 +5,7 @@
+ #include "gguf.h"
+ #include "llama-hparams.h"
+ #include "llama.h"
++#include "expert-stream.h"
+ 
+ #include <algorithm>
+ #include <array>
+@@ -1239,8 +1240,13 @@
+                 if (std::regex_search(tensor_name, pattern)) {
+                     if (overrides->buft == ggml_backend_cpu_buffer_type()) {
+                         // when overriding to a CPU buffer, consider the extra buffer types
+-                        buft = select_weight_buft(hparams, t_meta, op, buft_list_cpu);
+-                        if (use_mmap) {
++                        if (turbo64_16_mode() && use_mmap && op == GGML_OP_MUL_MAT_ID) {
++                            // Keep expert weights file-backed instead of making a repacked heap copy.
++                            buft = ggml_backend_cpu_buffer_type();
++                        } else {
++                            buft = select_weight_buft(hparams, t_meta, op, buft_list_cpu);
++                        }
++                        if (use_mmap && !turbo64_16_mode()) {
+                             static std::once_flag once;
+                             std::call_once(once, [] {
+                                 LLAMA_LOG_WARN("llama_model_loader: tensor overrides to CPU are used with mmap enabled - consider using --load-mode none for better performance\n");
+@@ -1408,6 +1414,10 @@
+ }
+ 
+ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps) {
++    if (turbo64_16_mode() && use_mmap) {
++        prefetch = false;
++        LLAMA_LOG_INFO("Turbo64-16: whole-model mmap prefetch disabled\n");
++    }
+     // note: read_lazy also requires mmap; this condition make sure it's usable even when --load-mode is not set to mmap
+     if (use_mmap || lazy.any()) {
+         mappings.reserve(files.size());
+--- a/tools/server/CMakeLists.txt
++++ b/tools/server/CMakeLists.txt
+@@ -67,3 +67,5 @@
+ 
+ target_link_libraries(${TARGET} PRIVATE llama-server-impl)
+ target_compile_features(${TARGET} PRIVATE cxx_std_17)
++
++add_subdirectory(${PROJECT_SOURCE_DIR}/turbo64-16 ${CMAKE_CURRENT_BINARY_DIR}/turbo64-16)
+--- a/common/log.h
++++ b/common/log.h
+@@ -46,6 +46,10 @@
+ bool common_log_get_jsonl(void);
+ 
+ void common_log_set_jsonl(bool jsonl); // not thread-safe
++
++using common_log_metadata_filter = bool (*)(const char * message, bool formatted);
++void common_log_set_metadata_only(common_log_metadata_filter filter);
++bool common_log_is_metadata_only();
+ 
+ int common_log_get_verbosity(enum ggml_log_level level);
+ 
+--- a/common/log.cpp
++++ b/common/log.cpp
+@@ -13,6 +13,7 @@
+ #include <thread>
+ #include <vector>
+ #include <algorithm>
++#include <atomic>
+ 
+ int common_log_verbosity_thold = LOG_DEFAULT_LLAMA;
+ 
+@@ -25,6 +26,22 @@
+ }
+ 
+ static bool common_log_jsonl = false;
++static std::atomic<common_log_metadata_filter> metadata_filter { nullptr };
++
++void common_log_set_metadata_only(common_log_metadata_filter filter) {
++    GGML_ASSERT(filter != nullptr);
++    common_log_metadata_filter expected = nullptr;
++    metadata_filter.compare_exchange_strong(expected, filter);
++}
++
++bool common_log_is_metadata_only() {
++    return metadata_filter.load() != nullptr;
++}
++
++static bool metadata_allowed(const char * message, bool formatted) {
++    auto filter = metadata_filter.load();
++    return !filter || filter(message, formatted);
++}
+ 
+ bool common_log_get_jsonl(void) {
+     return common_log_jsonl;
+@@ -232,7 +249,10 @@
+         return head == tail;
+     }
+ 
+-    void add(enum ggml_log_level level, const char * fmt, va_list args) {
++    void add(enum ggml_log_level level, const char * fmt, va_list args, bool checked = false) {
++        if (!checked && !metadata_allowed(fmt, false)) {
++            return;
++        }
+         std::unique_lock<std::mutex> lock(mtx);
+ 
+         // block if the queue is full
+@@ -486,7 +506,7 @@
+ }
+ 
+ void common_log_add_json(struct common_log * log, const char * type, const common_json & obj) {
+-    if (!common_log_jsonl) {
++    if (!common_log_jsonl || common_log_is_metadata_only()) {
+         return;
+     }
+ 
+@@ -542,9 +562,16 @@
+     }
+ }
+ 
++static void common_log_add_checked(struct common_log * log, ggml_log_level level, const char * fmt, ...) {
++    va_list args;
++    va_start(args, fmt);
++    log->add(level, fmt, args, true);
++    va_end(args);
++}
++
+ void common_log_default_callback(enum ggml_log_level level, const char * text, void * /*user_data*/) {
+     auto verbosity = common_log_get_verbosity(level);
+-    if (verbosity <= common_log_verbosity_thold) {
+-        common_log_add(common_log_main(), level, "%s", text);
+-    }
+-}
++    if (verbosity <= common_log_verbosity_thold && metadata_allowed(text, true)) {
++        common_log_add_checked(common_log_main(), level, "%s", text);
++    }
++}
+--- a/common/chat.cpp
++++ b/common/chat.cpp
+@@ -1477,7 +1477,7 @@
+     //LOG_DBG("Parsing PEG input with format %s: %s\n", common_chat_format_name(params.format), effective_input.c_str());
+ 
+     common_peg_parse_flags flags = COMMON_PEG_PARSE_FLAG_LENIENT;
+-    if (params.debug) {
++    if (params.debug && !common_log_is_metadata_only()) {
+         flags |= COMMON_PEG_PARSE_FLAG_DEBUG;
+     }
+ 
+@@ -1530,7 +1530,7 @@
+         fflush(stderr);
+     }
+ 
+-    if (!is_partial) {
++    if (!is_partial && !common_log_is_metadata_only()) {
+         LOG_DBG("Parsed message: %s\n", common_chat_msgs_to_json_oaicompat({ msg }).at(0).dump().c_str());
+     }
+     return msg;
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -4629,7 +4629,7 @@
+         // TODO: this log can become very long, put it behind a flag or think about a more compact format
+         //SRV_DBG("Prompt: %s\n", prompt.is_string() ? prompt.get<std::string>().c_str() : prompt.dump(2).c_str());
+ 
+-        if (!params.path_prompts_log_dir.empty()) {
++        if (!params.path_prompts_log_dir.empty() && !common_log_is_metadata_only()) {
+             const auto file_path = std::filesystem::path(params.path_prompts_log_dir) / string_format("%012" PRId64 ".txt", ggml_time_ms());
+             std::ofstream f(file_path);
+             if (f) {
+--- a/tools/server/server-http.cpp
++++ b/tools/server/server-http.cpp
+@@ -51,6 +51,10 @@
+ }
+ 
+ static void log_server_request(const httplib::Request & req, const httplib::Response & res) {
++    if (common_log_is_metadata_only()) {
++        SRV_TRC("HTTP metadata: status=%d request_bytes=%zu response_bytes=%zu\n", res.status, req.body.size(), res.body.size());
++        return;
++    }
+     // skip logging requests that are regularly sent, to avoid log spam
+     if (req.path == "/health"
+         || req.path == "/v1/health"
+@@ -179,6 +183,9 @@
+ 
+     srv->set_default_headers({{"Server", "llama.cpp"}});
+     // srv->set_logger(log_server_request); // TODO @ngxson : this is too spamy, no very useful; improve it in the future
++    if (common_log_is_metadata_only()) {
++        srv->set_logger(log_server_request);
++    }
+     srv->set_exception_handler([](const httplib::Request &, httplib::Response & res, const std::exception_ptr & ep) {
+         // this is fail-safe; exceptions should already handled by `ex_wrapper`
+ 
