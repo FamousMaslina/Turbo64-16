@@ -4,6 +4,14 @@ Date: 2026-10-07. Windows 11, Ryzen 7950X, 64 GB RAM, RTX 4080, driver 610.74. S
 
 ## Full server configuration
 
+### User-reported long prompt
+
+A later user-reported Turbo64-16 run processed a 7,482-token prompt in approximately 527 seconds with a configured 65,536-token context. Prefill averaged 14.19 tokens/s; generation averaged 3.18 tokens/s over 663 generated tokens.
+
+Compared with the earlier reported stock reference of 8.35 tokens/s prefill and 3.83 tokens/s generation, this is approximately 1.70x prefill (+70%) and 17% lower generation. This is not a controlled A/B comparison. The long run's binary revision, cache state, and other runtime conditions have not been independently verified, and no raw log for this run was supplied with the report. The 65K figure describes configured context capacity, not a fully populated context.
+
+### Local 1,024-token tests
+
 Mode 2, same model and user settings: context 65536, GPU layers all, CPU MoE 47, decode threads 16, batch threads 24, batch 4096, microbatch 1024, Flash Attention on, mmap, one slot, Jinja, reasoning on. Validation used loopback port 5558 and disabled startup warmup. User launcher uses the original port 5559 and default warmup behavior.
 
 Each request had 1024 input tokens with `cache_n=0`. The prompt was repeated inference-related prose through `/completion`, not a chat-template quality evaluation.
