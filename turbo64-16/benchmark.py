@@ -2,6 +2,7 @@
 
 import argparse
 import datetime
+import hashlib
 import json
 import statistics
 import time
@@ -23,6 +24,7 @@ def main():
     parser.add_argument("--repetitions", type=int, default=3)
     parser.add_argument("--generate", type=int, default=16)
     parser.add_argument("--label", default="turbo2")
+    parser.add_argument("--workload", help="Use a repeatable prompt prefix across fresh server launches for matched A/B runs.")
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     if args.tokens < 32 or args.tokens + args.generate >= 65536 or args.generate < 1 or args.repetitions < 1:
@@ -39,7 +41,8 @@ def main():
     prose = "Explain how memory capacity, disk bandwidth, and transfer latency affect large language model inference. "
     for index in range(args.repetitions):
         # Change the start of every prompt so the server cannot reuse a previous KV prefix.
-        prefix = f"Independent benchmark {args.label} {index} {time.time_ns()}. "
+        prefix = (f"Independent benchmark {args.workload} {index}. " if args.workload else
+                  f"Independent benchmark {args.label} {index} {time.time_ns()}. ")
         tokens = request(args.url, "/tokenize", {"content": prefix + prose * args.tokens})["tokens"][:args.tokens]
         if len(tokens) != args.tokens:
             raise RuntimeError("Tokenizer returned too few tokens.")
@@ -55,7 +58,9 @@ def main():
         if result["timings"].get("cache_n", 0) != 0 or result["timings"]["prompt_n"] != args.tokens:
             raise RuntimeError("The server reused a prompt prefix or processed a different token count; discard this run.")
         run = {"wall_seconds": time.perf_counter() - started, "timings": result["timings"],
-               "tokens_cached": result.get("tokens_cached")}
+               "tokens_cached": result.get("tokens_cached"),
+               "prompt_sha256": hashlib.sha256(json.dumps(tokens).encode()).hexdigest(),
+               "response_sha256": hashlib.sha256(result.get("content", "").encode()).hexdigest()}
         report["runs"].append(run)
         print(json.dumps(run), flush=True)
         output = args.output or Path(__file__).parent / f"results-{args.label}.json"

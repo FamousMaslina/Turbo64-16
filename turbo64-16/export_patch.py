@@ -13,7 +13,7 @@ def main():
     hooks += ["common/log.h", "common/log.cpp", "common/chat.cpp", "tools/server/server-context.cpp", "tools/server/server-http.cpp"]
     additions = [
         "expert-stream.h", "expert-stream.cpp", "test-expert-stream.cpp",
-        "build.cmd", "run-server.cmd", "benchmark.py", "export_patch.py", "README.md", "RESULTS.md",
+        "build.cmd", "run-server.cmd", "benchmark.py", "export_patch.py", "README.md", "RESULTS.md", "CHANGELOG.md",
         "CMakeLists.txt", "server-main.cpp", "package-server.cmake",
         "private-logs.cpp", "private-logs.h", "test-private-logs.cpp",
     ]
@@ -39,7 +39,7 @@ def main():
             fromfile="/dev/null", tofile="b/turbo64-16/" + name,
         ))
     (bundle / "turbo64-16.patch").write_text("".join(complete), encoding="utf-8", newline="\n")
-    (bundle / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    (bundle / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8", newline="\n")
     print("Exported source-hooks.patch, turbo64-16.patch, and manifest.json")
 
 

@@ -7,7 +7,7 @@ if (LLAMA_BUILD_TESTS)
     target_compile_features(test-turbo64-16-private-logs PRIVATE cxx_std_17)
 endif()
 if (WIN32)
-    target_link_libraries(turbo64-16-server PRIVATE psapi)
+    target_link_libraries(turbo64-16-server PRIVATE psapi shell32)
 endif()
 set(TURBO64_16_PACKAGE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/bin" CACHE PATH "Turbo64-16 server package directory")
 add_custom_target(turbo64-16-package ALL

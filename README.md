@@ -7,37 +7,35 @@ This project was fully vibe coded and built entirely to serve my own needs and h
 
 See [Turbo64-16 build, launch, API, and update instructions](turbo64-16/README.md) and [validation results](turbo64-16/RESULTS.md).
 
+## V0.2 update
+
+- Added `--turbo-prefill`, `--turbo-decode` and `--turbo-balanced` profiles with native argument overrides.
+- Grouped selected expert reads and overlapped bounded read-ahead with host staging.
+- Kept CUDA graphs unchanged. This release contains source only; build instructions are linked above.
+
 ## Observed performance
 
-These results come from my Windows 11 setup running MiMo-V2.6-Flash with a configured **65,536-token context**.
+Windows 11, Ryzen 7950X, 64 GB RAM, RTX 4080, MiMo-V2.6-Flash-MOPD, configured **65,536-token context**. The user repeated the same **7,482-token prompt workload** with the V0.2 prefill profile.
 
-### Longer prompt
-
-A **7,482-token prompt** completed prompt processing in about **527 seconds**:
-
-| Run | Prefill | Generation |
+| Metric | Previous Turbo run | V0.2 prefill profile |
 | --- | ---: | ---: |
-| Previous stock reference | 8.35 tokens/s | 3.83 tokens/s |
-| Turbo64-16 | **14.19 tokens/s** | **3.18 tokens/s** |
-| Difference from the reference | **About 1.70x / +70%** | **About 17% lower** |
+| Prefill | 14.19 tokens/s | **47.64 tokens/s** |
+| Prompt processing | 527.21 seconds | **157.06 seconds** |
+| Generation | 3.18 tokens/s | **3.11 tokens/s** |
+| Requested expert uploads | 665.00 GiB | **195.16 GiB** |
 
-The Turbo run generated **663 tokens** at an average of 3.18 tokens/s. The current optimization favors **prompt ingestion over token generation**; improving decode performance remains a work in progress.
+Prefill was **3.36x faster (+236%)**, taking **70.2% less time** and saving about **6 minutes 10 seconds**. Generation was roughly unchanged; the runs generated 663 and 421 tokens respectively, so their generation durations and total request times are not directly comparable.
 
-### Shorter uncached prompts
+This is one observed before/after comparison, without resetting the Windows file cache. It is not a universal speedup claim. The 65K figure is allocated context capacity; the prompt filled about 7.5K tokens. Requested uploads are not measured physical disk reads.
 
-The 1,024-token tests reached:
+Correctness checks include **14 byte-exact Q2_K/MXFP4 transfer cases per tested configuration**, **77/77 selected CUDA-vs-CPU expert matmul checks**, and model checks for all three profiles. Methodology, earlier synthetic results and limitations are in [turbo64-16/RESULTS.md](turbo64-16/RESULTS.md).
 
-- **20.56 tokens/s** prefill on the first run.
-- **18.44 tokens/s** prefill on the repeat run.
+After building, select a profile on the packaged server:
 
-These rates are approximately **2.21-2.46x** the previously reported 8.35 tokens/s stock prefill figure.
+```bat
+turbo64-16\bin\llama-server.exe --turbo-prefill
+```
 
-### How to interpret these results
-
-**This is not yet a controlled stock-vs-Turbo A/B benchmark.** The stock reference comes from an earlier run; the Turbo tests may differ in binary, cache state, and other runtime conditions. Treat these as **observed results on my machine, not a universal speedup claim**. A configured 65K context also does not mean the tests filled that entire context.
-
-Correctness checks include byte-exact expert-transfer validation for **Q2_K and MXFP4** and **77/77 selected CUDA-vs-CPU expert matrix multiplication checks passing**. Configuration, methodology, local raw-result references, limitations, and correctness details are in [turbo64-16/RESULTS.md](turbo64-16/RESULTS.md).
-
-Performance will vary with model quantization, RAM capacity and speed, storage, GPU, CPU, cache state, context length, and batch settings.
+Performance varies with hardware, quantization, file-cache state, context length and batch settings. Decode optimization remains a work in progress.
 
 Upstream licensing and credits are retained in [LICENSE](LICENSE) and [AUTHORS](AUTHORS).

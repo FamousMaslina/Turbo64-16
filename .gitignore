@@ -157,6 +157,7 @@ AGENTS.local.md
 # Turbo64-16 local artifacts
 /turbo64-16/bin/
 /turbo64-16/bin-next/
+/turbo64-16/baseline-log-build/
 /turbo64-16/__pycache__/
 /turbo64-16/replay-check/
 /turbo64-16/github-import/

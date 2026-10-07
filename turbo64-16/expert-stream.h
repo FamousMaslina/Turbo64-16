@@ -34,6 +34,7 @@ private:
         size_t bytes = 0;
         size_t chunks = 0;
         int64_t prefetch_us = 0;
+        int64_t prefetch_wait_us = 0;
         int64_t wait_us = 0;
         int64_t stage_us = 0;
         int64_t enqueue_us = 0;

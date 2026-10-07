@@ -1,3 +1,32 @@
+# Instructions for Turbo64-16
+
+## Private project and publishing
+
+- Turbo64-16 is the user's private, independent project based on llama.cpp. We are NOT upstream llama.cpp contributors.
+- Work in this repository is for this project, not an upstream contribution. The upstream contributor and submission rules below apply only when the user explicitly requests an upstream contribution [WHICH WILL NEVER HAPPEN].
+- Keep changes local by default. Do not push to any repository, create pull requests, or publish releases unless the user explicitly instructs you to perform that action.
+- Permission for an earlier push or release is not ongoing permission. Ordinary edits do not authorize a commit, push, or publication; each requires an explicit user instruction.
+- Continue to use the relevant code-quality, security, and review guidance for local work.
+
+## Target Git repository
+
+- Turbo64-16 repository: [FamousMaslina/Turbo64-16](https://github.com/FamousMaslina/Turbo64-16).
+- Git remote `origin`: `https://github.com/FamousMaslina/Turbo64-16.git`.
+- This is the target for explicitly authorized pushes. Listing it here does not grant permission to push or publish.
+
+## Target PC and toolchain
+
+- OS: Windows 11.
+- CPU: AMD Ryzen 9 7950X.
+- RAM: 64 GB DDR5 at 5200 MT/s.
+- Storage: Gen5 NVMe on `C:`.
+- GPU: NVIDIA GeForce RTX 4080.
+- MSYS is installed at `C:\msys64`.
+- `CUDA_HOME` is configured, and CUDA tools are available on `PATH`.
+- **CUDA graphs:** leave them alone - they're working extremely well.
+
+---
+
 # Instructions for llama.cpp
 
 > [!IMPORTANT]

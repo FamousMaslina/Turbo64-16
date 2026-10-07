@@ -2,6 +2,8 @@
 
 Opt-in Windows optimization for MiMo-V2.6-Flash on Ryzen 7950X, 64 GB RAM, Gen5 NVMe, RTX 4080. Based on the supplied llama.cpp-b11475 source archive. Maintained independently of ggml-org/llama.cpp; no upstream submission is intended.
 
+V0.2 processed the user's 7,482-token prompt at **47.64 tokens/s**, up from **14.19 tokens/s** in the previous Turbo run (3.36x). Prompt time fell from 527.21 to 157.06 seconds. Decode was approximately unchanged at 3.11 versus 3.18 tokens/s, with different output lengths. This is one observed comparison with uncontrolled file-cache state. See [results](RESULTS.md) and the [short update log](CHANGELOG.md).
+
 ## Run
 
 From the source directory in Command Prompt:
@@ -11,6 +13,26 @@ turbo64-16\run-server.cmd 2
 ```
 
 This uses the bespoke `turbo64-16\bin\llama-server.exe` and your original model, 64K context, `--n-cpu-moe 47`, 16 decode threads, 24 batch threads, batch 4096, microbatch 1024, Flash Attention, mmap, Jinja, and reasoning. It listens on all IPv4 interfaces (`0.0.0.0:5559`), including LAN. Stop any existing server on that port first. You can also run the bespoke executable without arguments to use the same model profile.
+
+Select a named profile directly on the packaged executable:
+
+```bat
+turbo64-16\bin\llama-server.exe --turbo-prefill
+turbo64-16\bin\llama-server.exe --turbo-decode
+turbo64-16\bin\llama-server.exe --turbo-balanced
+```
+
+| Flag | Microbatch | Purpose |
+| --- | ---: | --- |
+| `--turbo-prefill` | 4096 | Preserve the tested profile with the highest prompt-processing speed |
+| `--turbo-decode` | 1024 | Use the tested smaller batch with the highest observed generation speed |
+| `--turbo-balanced` | 2048 | Use an intermediate batch and memory footprint |
+
+All three supply the same model, 64K context, CPU MoE 47, 16 decode/24 batch threads, batch 4096, Flash Attention, mmap, one slot, Jinja, reasoning, and default 128 MiB asynchronous read-ahead in mode 2. These are measured configuration choices, not guarantees across workloads or file-cache states. CPU prefetch is not included because the experiment slowed generation. CUDA graphs are unchanged.
+
+Choose only one profile per launch. Native options override its defaults, including aliases and negative options. For example, `llama-server.exe --turbo-prefill --ubatch-size 2048 --port 5560` changes microbatch and port. Existing environment overrides remain available. With no arguments the executable selects the decode profile; custom arguments without a profile retain the previous native-argument behavior. `--help` lists the profiles.
+
+The launcher also accepts these flags and forwards further server arguments: `turbo64-16\run-server.cmd --turbo-prefill`. The existing numeric mode and explicit microbatch syntax remains available.
 
 ## Connect your app over LAN
 
@@ -47,7 +69,7 @@ set TURBO64_16_DIAGNOSTICS=0
 turbo64-16\run-server.cmd 2
 ```
 
-The default logger then uses info verbosity. Set `LLAMA_ARG_LOG_VERBOSITY=4` for trace or `5` for debug. Set `LLAMA_ARG_LOG_FILE` to choose another file, or pass `--log-file`. Other native server arguments override the bespoke host/port/logging defaults. When passing your own arguments directly to the executable, include `-m` and the model settings you want; the full MiMo profile is supplied automatically only when no arguments are given.
+The default logger then uses info verbosity. Set `LLAMA_ARG_LOG_VERBOSITY=4` for trace or `5` for debug. Set `LLAMA_ARG_LOG_FILE` to choose another file, or pass `--log-file`. Other native server arguments override the bespoke host/port/logging defaults. The full MiMo profile is supplied when no arguments are given or when a named Turbo profile is selected. Otherwise include `-m` and the model settings you want.
 
 The environment variable `TURBO64_16` selects the behavior when the process starts:
 
@@ -55,7 +77,11 @@ The environment variable `TURBO64_16` selects the behavior when the process star
 | --- | --- |
 | 0 or unset | Original source behavior, including normal CPU repacking and startup prefetch |
 | 1 | File-backed CPU expert weights, no whole-model startup prefetch, bounded selected-expert read-ahead |
-| 2 | Mode 1 plus 2 x 32 MiB host staging buffers with event-protected asynchronous GPU uploads |
+| 2 | Mode 1 plus 2 x 32 MiB host staging buffers with event-protected asynchronous GPU uploads and bounded asynchronous read-ahead |
+
+Mode 2 groups selected ranges into windows and prepares the next window while staging the current one. At most one future window is in flight. `TURBO64_16_READAHEAD_MIB` sets the selected bytes per window (32-256, default 128); `TURBO64_16_READAHEAD_ASYNC=0` uses synchronous read-ahead for comparison. Mode 1 always uses synchronous read-ahead. All prefetch tasks finish before the tensor copy callback returns.
+
+Asynchronous `prefetch_ms` measures worker time and can overlap `host_stage_ms`; these counters must not be added together. `prefetch_wait_ms` measures host time waiting for a read-ahead task. Prefetch completion does not prove physical disk I/O completion or page residency.
 
 The custom upload path handles batches of at least 32 tokens. Smaller batches use the original copy callback. Expert placement stays file-backed for the process lifetime, so CPU decode also uses unrepacked experts; decode performance can change. Switching modes requires restarting the server. Host staging does not allocate additional expert caches in VRAM. Backend capability/allocation failure falls back to prefetch-only transfers.
 
@@ -71,7 +97,11 @@ Restart with `turbo64-16\run-server.cmd 0` and repeat with `--label original`. U
 
 Repeat the same workload and include both initial and later runs. Windows file caching makes a single result noisy. Do not compare a cached prompt against an uncached one. Report prompt/generation speeds, dedicated/shared GPU memory from Task Manager, RAM use, and whether normal chat output looks correct. Do not run stock and Turbo simultaneously.
 
-If testing larger prompts, try changing `-ub 1024` to `-ub 2048` and then `-ub 4096` in the launcher, keeping `-b 4096`. Larger microbatches amortize expert reads across more tokens but need more compute memory. These values are experiments, not validated defaults. Stop increasing the microbatch if shared GPU memory appears or performance drops.
+Use `--workload <name>` with the same token count and repetition count across fresh server launches for repeatable synthetic A/B prompts. Reports include prompt and response SHA-256 hashes without storing conversation text. The existing cache checks still reject reused prefixes. This synthetic workload is not the user's workload from the supplied log.
+
+The pre-update executable and DLLs are preserved locally under `baseline-log-build/`; `run-server.cmd baseline` runs that build with the original 1024 microbatch. `run-server.cmd 2 2048` or `run-server.cmd 2 4096` chooses a microbatch explicitly. The baseline binaries are local artifacts and are not included in the source patch.
+
+The named profiles provide the tested 1024, 2048 and 4096 microbatch settings, keeping `-b 4096`. Larger microbatches amortize expert reads across more tokens but need more compute memory. The 4096 profile fit on this PC during the recorded tests. More desktop GPU usage or a different workload can change available headroom. Shared GPU usage includes CUDA host allocations and by itself does not prove device-memory spill; compare dedicated usage and throughput as well.
 
 ## Architecture and approach
 
@@ -79,7 +109,7 @@ The local GGUF metadata confirms 48 layers, hidden size 4096, 256 routed experts
 
 On this machine, CPU expert repacking can allocate anonymous copies of mapped weights. Retaining ordinary CPU buffers lets weights remain file-backed and lets the existing scheduler offload supported prefill matmuls to CUDA. Decode still runs through the normal scheduler. This removes an expert-weight duplication path; it does not make the entire model fit in RAM or eliminate disk reads.
 
-The existing selected-expert copy callback supplies actual routing IDs. Turbo coalesces consecutive selected experts, preserves the original MMQ padding, prefetches at most 128 MiB per window using the existing Windows helper, and uploads chunks of at most 32 MiB. Two pinned host buffers let the host prepare the next chunk while a previous transfer completes. Events prevent overwriting a buffer still in use by the GPU; destruction waits for pending transfers. There is no speculative routing, cross-layer GPU compute/copy pipeline, persistent GPU expert cache, model rewriting, or quantization change.
+The existing selected-expert copy callback supplies actual routing IDs. Turbo coalesces consecutive selected experts, preserves the original MMQ padding, prefetches bounded windows using the existing Windows helper, and uploads chunks of at most 32 MiB. Two pinned host buffers let the host prepare the next chunk while a previous transfer completes. Events prevent overwriting a buffer still in use by the GPU; destruction waits for pending transfers. Read-ahead overlaps the current window's staging and never predicts future-layer routing. There is no cross-layer GPU compute/copy pipeline, persistent GPU expert cache, model rewriting, or quantization change. CUDA graphs and CUDA kernel sources are unchanged.
 
 Sources:
 
@@ -110,7 +140,7 @@ The private-log regression runs at maximum verbosity with JSONL enabled and forc
 
 ## Update or remove
 
-Ten existing source files have small hooks: the original four under `src/`, the build hook in `tools/server/CMakeLists.txt`, logging hooks in `common/log.h` and `common/log.cpp`, the parser-debug guard in `common/chat.cpp`, and guards in `tools/server/server-context.cpp` and `tools/server/server-http.cpp`. The Turbo implementation, private logging policy, tests, launch/build/benchmark scripts, documentation, and patch bundle live in `turbo64-16/`. No ggml kernels, public llama API, or MiMo graph files are modified.
+Ten existing source files have hooks: the original four under `src/`, the build hook in `tools/server/CMakeLists.txt`, logging hooks in `common/log.h` and `common/log.cpp`, the parser-debug guard in `common/chat.cpp`, and guards in `tools/server/server-context.cpp` and `tools/server/server-http.cpp`. The Turbo implementation, private logging policy, tests, launch/build/benchmark scripts, documentation, and patch bundle live in `turbo64-16/`. No ggml backend files, public llama API, CUDA graphs, CUDA kernels, or MiMo graph files are modified.
 
 Original copies are under `turbo64-16/original/` with their source paths preserved. `source-hooks.patch` contains just the small upstream hooks; `turbo64-16.patch` also includes the new standalone files.
 

@@ -2,13 +2,66 @@
 
 Date: 2026-10-07. Windows 11, Ryzen 7950X, 64 GB RAM, RTX 4080, driver 610.74. Supplied source: llama.cpp-b11475 archive, no Git metadata. Release build: MSVC 19.44.35228, CUDA 12.8, sm_89, native CPU instructions.
 
+## V0.2: user 7,482-token workload
+
+The user reran the same prompt workload with the V0.2 prefill profile. Both logs report 7,482 processed prompt tokens and a 65,536-token context. This is a single before/after observation; initial Windows file-cache state and other runtime conditions were not controlled, and the logs do not contain prompt hashes.
+
+| Metric | Previous Turbo run | V0.2 prefill profile |
+| --- | ---: | ---: |
+| Prefill rate | 14.19 tokens/s | 47.64 tokens/s |
+| Prompt processing | 527.21276 s | 157.05743 s |
+| Decode rate | 3.18 tokens/s | 3.11 tokens/s |
+| Generated tokens | 663 | 421 |
+| Requested expert uploads | 665.00 GiB | 195.16 GiB |
+| Large staged prefill graphs | 8 | 2 |
+| Host staging | 386.04 s | 131.82 s |
+| Prefetch calls / worker time | 93.76 s | 39.33 s |
+| Host wait for read-ahead task | synchronous calls | 7.32 s |
+| Staging-buffer waits | 2.61 s | 0.48 s |
+
+Observed prefill throughput increased 3.36x (+235.7%); prompt time fell 70.2%, saving 370.16 seconds. Requested expert uploads fell 70.7%. New prefetch worker time overlaps staging and must not be added to it; the Windows hint completing does not guarantee page residency. These counters are not physical disk measurements.
+
+Decode rate was approximately 2.3% lower. The generated lengths differ, so generation duration and total request duration are not fair comparisons. CUDA graphs remain unchanged. The new log confirms `n_ubatch=4096` and `async=1`; actual staged batches were 3386 and 4092 tokens, with four further prompt tokens handled separately.
+
+CUDA compute buffers increased from 1490.54 to 2722.17 MiB, sliding-window KV buffers from 243.75 to 828.75 MiB, and CUDA host compute buffers from 194.55 to 802.20 MiB. Model buffers and full-attention KV allocation were unchanged. RAM utilization still reached 99%. Shared GPU allocation alone does not establish device-memory spill.
+
+Local log references: `turbo-17913872839014607.log` and `turbo-17914001968799851.log`. Raw logs are not included in the source release.
+
+## Read-ahead update and named profiles
+
+The packaged server now supports `--turbo-prefill`, `--turbo-decode` and `--turbo-balanced`. They select microbatches 4096, 1024 and 2048 respectively; all other model settings remain the same. A custom native CLI option replaces the corresponding profile default. No-argument startup retains the 1024 decode profile. CUDA graphs and CUDA kernel sources are unchanged.
+
+Matched synthetic tests used fresh server processes, 4096 prompt tokens, 128 greedy generated tokens, seed 1234, 64K allocated context, no warmup, and diagnostics disabled. The `--workload flash-transfer-v2` prefix produced identical prompt-token hashes; all five cases below also produced identical response hashes. Each configuration ran once in the listed order, without resetting the Windows file cache. These are exploratory measurements rather than controlled repeated speedup estimates.
+
+| Build / configuration | Prefill tokens/s | Decode tokens/s | Prompt seconds |
+| --- | ---: | ---: | ---: |
+| Preserved pre-update mode 2, microbatch 1024 | 25.97 | 5.84 | 157.69 |
+| New asynchronous read-ahead, microbatch 1024 | 30.96 | 7.65 | 132.29 |
+| New asynchronous read-ahead, microbatch 2048 | 44.37 | 4.52 | 92.32 |
+| New asynchronous read-ahead, microbatch 4096 | 74.16 | 4.25 | 55.23 |
+| Experimental per-matrix CPU prefetch, microbatch 4096 | 75.68 | 2.82 | 54.12 |
+
+The 4096 case delivered approximately 2.85x the prefill rate of the matched pre-update run. The CPU prefetch experiment slowed generation and was removed from the final source and build. Smaller microbatches showed faster generation in this sample; file-cache residency can contribute, and the decode profile name does not guarantee a fixed speedup. The balanced profile offers the intermediate microbatch and memory footprint.
+
+The 4096 profile used approximately 15,026-15,065 MiB total dedicated GPU memory in observed device samples, including desktop applications. One process sample showed about 12.94 GiB dedicated and 0.92 GiB shared GPU allocation. Shared allocations include CUDA host buffers; these samples do not isolate memory spill or establish peak memory use. More desktop GPU activity can reduce available headroom. Model process working sets remained around 53 GiB.
+
+Raw matched reports: `results-matched-baseline.json`, `results-matched-async1024.json`, `results-matched-async2048.json`, `results-matched-async4096.json`, and the rejected `results-matched-async4096-cpuprefetch.json`. Pre-update binaries are retained in `baseline-log-build/`, with hashes in `baseline-build-manifest.json`. The synthetic prose prompt differs from the user's original workload; the user's later 7,482-token workload comparison is recorded above.
+
+Transfer validation passed all 14 Q2_K/MXFP4 selections in mode 1, mode 2 with synchronous 128 MiB windows, and mode 2 with asynchronous 32 and 128 MiB windows. Cases cover fragmented selections spanning window boundaries, MMQ padding, the 31/32-token dispatch boundary, repeated uploads, buffer reuse and destruction. CUDA expert matmuls versus CPU passed all 77 selected backend cases. Metadata-only logging regression passed. These checks do not establish full-model perplexity or equivalence for all inputs.
+
+Named-profile integration checks used the actual packaged executable and a shared 3072-token prompt with diagnostics enabled. All three loaded the intended model with 64K context and one slot, respected their microbatch limits, used asynchronous read-ahead, and produced identical greedy response hashes over 16 generated tokens. The largest staged token counts were 3068 (prefill), 1024 (decode) and 2048 (balanced). These short generation checks establish behavior rather than decode performance rankings. Evidence: `profile-model-check.json`, `results-profile-prefill.json`, `results-profile-decode.json`, and `results-profile-balanced.json`.
+
+A separate model run with default warmup verified long native aliases overriding the prefill preset: `--ctx-size 8192`, `--parallel 2`, `--ubatch-size 512`, and `--no-jinja`. The server reported two slots with 4096 context per slot, and a 600-token completion staged no more than 512 tokens per microbatch. Profile help, conflicting-profile rejection, argument-value preservation and the launcher forwarding path also passed. Evidence: `profile-overrides-check.json`, `profile-cli-check.log`, and `launcher-help-check.log`.
+
 ## Full server configuration
 
 ### User-reported long prompt
 
 A later user-reported Turbo64-16 run processed a 7,482-token prompt in approximately 527 seconds with a configured 65,536-token context. Prefill averaged 14.19 tokens/s; generation averaged 3.18 tokens/s over 663 generated tokens.
 
-Compared with the earlier reported stock reference of 8.35 tokens/s prefill and 3.83 tokens/s generation, this is approximately 1.70x prefill (+70%) and 17% lower generation. This is not a controlled A/B comparison. The long run's binary revision, cache state, and other runtime conditions have not been independently verified, and no raw log for this run was supplied with the report. The 65K figure describes configured context capacity, not a fully populated context.
+Compared with the earlier reported stock reference of 8.35 tokens/s prefill and 3.83 tokens/s generation, this is approximately 1.70x prefill (+70%) and 17% lower generation. This is not a controlled A/B comparison. The subsequently supplied `turbo-17913872839014607.log` confirms the long-run timings and configuration; the binary revision and initial file-cache state remain unverified. The 65K figure describes configured context capacity, not a fully populated context.
+
+The supplied log records eight staged prefill graphs with 665.00 GiB requested expert uploads, 386.04 s host staging, 93.76 s prefetch calls, 2.61 s staging-buffer waits, and 1.27 s enqueue calls. RAM availability during most of prefill was approximately 0.26 GiB at 99% utilization. These counters do not measure physical disk reads. Decode's 663 graph submissions had a 200.75 ms median; 14 submissions above one second consumed 51.48 s in total, with a maximum of 7.70 s.
 
 ### Local 1,024-token tests
 

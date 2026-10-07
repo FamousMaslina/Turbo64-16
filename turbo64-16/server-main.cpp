@@ -1,3 +1,4 @@
+#include "arg.h"
 #include "log.h"
 #include "private-logs.h"
 
@@ -9,8 +10,10 @@
 #include <cstring>
 #include <filesystem>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #ifdef _WIN32
@@ -22,6 +25,7 @@
 #endif
 #include <windows.h>
 #include <psapi.h>
+#include <shellapi.h>
 #endif
 
 int llama_server(int argc, char ** argv);
@@ -51,6 +55,28 @@ static void print_banner() {
  +------------------------------------------------------+
 )", stderr);
     std::fflush(stderr);
+}
+
+struct turbo_profile {
+    const char * flag;
+    const char * name;
+    const char * microbatch;
+};
+
+static const turbo_profile profiles[] = {
+    {"--turbo-prefill",  "prefill",  "4096"},
+    {"--turbo-decode",   "decode",   "1024"},
+    {"--turbo-balanced", "balanced", "2048"},
+};
+
+static void print_profiles() {
+    std::fputs("\nTurbo64-16 profiles (select one; native arguments override profile defaults):\n"
+               "  --turbo-prefill   Prioritize prompt processing; microbatch 4096.\n"
+               "  --turbo-decode    Prioritize generation; microbatch 1024.\n"
+               "  --turbo-balanced Use an intermediate microbatch of 2048.\n"
+               "All profiles use the local MiMo model, 64K context, CPU MoE 47, 16/24 threads,\n"
+               "batch 4096, Flash Attention, mmap, one slot, Jinja and reasoning.\n"
+               "No arguments selects --turbo-decode. Custom arguments without a profile retain native defaults.\n\n", stderr);
 }
 
 struct hardware_monitor {
@@ -116,6 +142,43 @@ struct hardware_monitor {
 
 int main(int argc, char ** argv) {
     common_log_set_metadata_only(turbo64_16_metadata_log);
+#ifdef _WIN32
+    // Profile expansion changes argc, so the native parser cannot repair these UTF-8 arguments.
+    int count = 0;
+    wchar_t ** wide = CommandLineToArgvW(GetCommandLineW(), &count);
+    if (!wide) {
+        std::fputs("Turbo64-16: cannot read the command line.\n", stderr);
+        return 2;
+    }
+    std::vector<std::string> utf8_arguments;
+    for (int i = 0; i < count; ++i) {
+        const int size = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, wide[i], -1, nullptr, 0, nullptr, nullptr);
+        if (!size) {
+            LocalFree(wide);
+            std::fputs("Turbo64-16: invalid command-line encoding.\n", stderr);
+            return 2;
+        }
+        std::string value(size, '\0');
+        WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, wide[i], -1, value.data(), size, nullptr, nullptr);
+        value.pop_back();
+        utf8_arguments.push_back(std::move(value));
+    }
+    LocalFree(wide);
+    std::vector<char *> utf8_pointers;
+    for (auto & value : utf8_arguments) {
+        utf8_pointers.push_back(value.data());
+    }
+    utf8_pointers.push_back(nullptr);
+    argc = count;
+    argv = utf8_pointers.data();
+#endif
+    common_params params;
+    auto parser = common_params_parser_init(params, LLAMA_EXAMPLE_SERVER);
+    const turbo_profile * profile = argc == 1 ? &profiles[1] : nullptr;
+    std::vector<std::string> supplied;
+    std::set<std::string> specified;
+    bool information = false;
+    bool help = false;
     for (int i = 1; i < argc; ++i) {
         std::string option = argv[i];
         std::replace(option.begin(), option.end(), '_', '-');
@@ -123,8 +186,43 @@ int main(int argc, char ** argv) {
             std::fputs("Turbo64-16: conversation-content capture options are disabled.\n", stderr);
             return 2;
         }
+        const turbo_profile * selected = nullptr;
+        for (const auto & candidate : profiles) {
+            if (option == candidate.flag) {
+                selected = &candidate;
+                break;
+            }
+        }
+        if (selected) {
+            if (profile) {
+                std::fputs("Turbo64-16: select only one Turbo profile.\n", stderr);
+                return 2;
+            }
+            profile = selected;
+            continue;
+        }
+        help |= option == "--help" || option == "-h";
+        information |= help || option == "--version" || option == "--list-devices";
+        supplied.emplace_back(argv[i]);
+        // Use the native option metadata so argument values are never read as profile flags.
+        for (const auto & opt : parser.options) {
+            if (std::find(opt.args.begin(), opt.args.end(), option) == opt.args.end() &&
+                    std::find(opt.args_neg.begin(), opt.args_neg.end(), option) == opt.args_neg.end()) {
+                continue;
+            }
+            specified.insert(opt.args.begin(), opt.args.end());
+            specified.insert(opt.args_neg.begin(), opt.args_neg.end());
+            const int values = opt.handler_str_str ? 2 : (opt.handler_int || opt.handler_string ? 1 : 0);
+            for (int value = 0; value < values && i + 1 < argc; ++value) {
+                supplied.emplace_back(argv[++i]);
+            }
+            break;
+        }
     }
     print_banner();
+    if (help) {
+        print_profiles();
+    }
     set_default("TURBO64_16", "2");
     set_default("TURBO64_16_DIAGNOSTICS", "1");
     const bool diagnostics = std::strcmp(std::getenv("TURBO64_16_DIAGNOSTICS"), "1") == 0;
@@ -137,11 +235,6 @@ int main(int argc, char ** argv) {
     set_default("LLAMA_ARG_ENDPOINT_SLOTS", "1");
     set_default("LLAMA_ARG_PERF", "1");
 
-    bool information = false;
-    for (int i = 1; i < argc; ++i) {
-        information |= std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0 ||
-                       std::strcmp(argv[i], "--version") == 0 || std::strcmp(argv[i], "--list-devices") == 0;
-    }
     if (!information && diagnostics && !std::getenv("LLAMA_ARG_LOG_FILE")) {
         std::error_code error;
         const auto directory = std::filesystem::absolute(argv[0]).parent_path() / "logs";
@@ -154,16 +247,27 @@ int main(int argc, char ** argv) {
         }
     }
 
-    std::vector<std::string> arguments;
-    if (argc == 1) {
-        arguments = {argv[0], "-m", "C:/Users/Tudi/Documents/Tudi/AI/MiMo-V2.6-Flash-MOPD-Q2_K-00001-of-00002.gguf",
-                     "-c", "65536", "-ngl", "all", "--n-cpu-moe", "47", "-t", "16", "-tb", "24",
-                     "-b", "4096", "-ub", "1024", "-fa", "on", "-lm", "mmap", "-np", "1", "--jinja", "--reasoning", "on"};
-    } else {
-        for (int i = 0; i < argc; ++i) {
-            arguments.emplace_back(argv[i]);
+    std::vector<std::string> arguments = {argv[0]};
+    if (profile && !information) {
+        const char * defaults[][2] = {
+            {"-m", "C:/Users/Tudi/Documents/Tudi/AI/MiMo-V2.6-Flash-MOPD-Q2_K-00001-of-00002.gguf"},
+            {"-c", "65536"}, {"-ngl", "all"}, {"--n-cpu-moe", "47"}, {"-t", "16"}, {"-tb", "24"},
+            {"-b", "4096"}, {"-ub", profile->microbatch}, {"-fa", "on"}, {"-lm", "mmap"},
+            {"-np", "1"}, {"--reasoning", "on"},
+        };
+        for (const auto & setting : defaults) {
+            if (specified.count(setting[0])) {
+                continue;
+            }
+            arguments.emplace_back(setting[0]);
+            arguments.emplace_back(setting[1]);
         }
+        set_default("TURBO64_16_READAHEAD_ASYNC", "1");
+        set_default("TURBO64_16_READAHEAD_MIB", "128");
+        set_default("LLAMA_ARG_JINJA", "1");
+        std::fprintf(stderr, "Turbo profile=%s | native CLI overrides are applied after profile defaults.\n", profile->name);
     }
+    arguments.insert(arguments.end(), supplied.begin(), supplied.end());
     std::vector<char *> pointers;
     for (auto & argument : arguments) {
         pointers.push_back(argument.data());

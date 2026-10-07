@@ -40,11 +40,12 @@ int main() {
             return 1;
         }
 
-        for (int pattern = 0; pattern < 5; ++pattern) {
+        for (int pattern = 0; pattern < 7; ++pattern) {
             std::vector<bool> used(64);
             for (size_t i = 0; i < used.size(); ++i) {
                 used[i] = pattern == 0 || (pattern == 1 && i % 2 == 0) ||
-                    (pattern == 2 && i >= 11 && i < 54) || (pattern == 3 && i == 63);
+                    (pattern == 2 && i >= 11 && i < 54) || (pattern == 3 && i == 63) ||
+                    (pattern == 5 && (i % 3 != 1)) || (pattern == 6 && (i < 7 || i >= 39));
             }
             std::fill(expected.begin(), expected.end(), 0xcc);
             ggml_backend_tensor_set(dst, expected.data(), 0, size);
@@ -57,12 +58,12 @@ int main() {
             }
             {
                 turbo64_16_stream stream;
-                if (stream.copy(backend.get(), src, dst, used, 1)) {
+                if (stream.copy(backend.get(), src, dst, used, 1) || stream.copy(backend.get(), src, dst, used, 31)) {
                     std::fprintf(stderr, "Decode must use the original copy path.\n");
                     return 1;
                 }
                 // Repeat without synchronizing to exercise event-protected buffer reuse.
-                if (!stream.copy(backend.get(), src, dst, used, 1024) ||
+                if (!stream.copy(backend.get(), src, dst, used, 32) ||
                         !stream.copy(backend.get(), src, dst, used, 1024)) {
                     return 1;
                 }
