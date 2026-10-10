@@ -2,6 +2,8 @@
 setlocal
 cd /d "%~dp0.."
 if "%~1"=="--turbo-prefill" goto profile
+if "%~1"=="--turbo-prefill2" goto profile
+if "%~1"=="--prefill-kv" goto profile
 if "%~1"=="--turbo-decode" goto profile
 if "%~1"=="--turbo-balanced" goto profile
 set "TURBO64_16=2"

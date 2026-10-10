@@ -681,11 +681,13 @@
 +exit /b 0
 --- /dev/null
 +++ b/turbo64-16/run-server.cmd
-@@ -0,0 +1,33 @@
+@@ -0,0 +1,35 @@
 +@echo off
 +setlocal
 +cd /d "%~dp0.."
 +if "%~1"=="--turbo-prefill" goto profile
++if "%~1"=="--turbo-prefill2" goto profile
++if "%~1"=="--prefill-kv" goto profile
 +if "%~1"=="--turbo-decode" goto profile
 +if "%~1"=="--turbo-balanced" goto profile
 +set "TURBO64_16=2"
@@ -717,7 +719,7 @@
 +exit /b %errorlevel%
 --- /dev/null
 +++ b/turbo64-16/benchmark.py
-@@ -0,0 +1,76 @@
+@@ -0,0 +1,99 @@
 +"""Measure uncached prefill on a running llama-server using only Python's standard library."""
 +
 +import argparse
@@ -745,10 +747,14 @@
 +    parser.add_argument("--generate", type=int, default=16)
 +    parser.add_argument("--label", default="turbo2")
 +    parser.add_argument("--workload", help="Use a repeatable prompt prefix across fresh server launches for matched A/B runs.")
++    parser.add_argument("--document", type=Path, help="Prefill this entire UTF-8 document instead of synthetic text.")
++    parser.add_argument("--prompt", type=Path, help="UTF-8 question to append to the document using the model's chat template.")
 +    parser.add_argument("--output", type=Path)
 +    args = parser.parse_args()
 +    if args.tokens < 32 or args.tokens + args.generate >= 65536 or args.generate < 1 or args.repetitions < 1:
 +        parser.error("Use 32 <= tokens, 1 <= generate, tokens + generate < 65536, repetitions >= 1.")
++    if bool(args.document) != bool(args.prompt):
++        parser.error("Use --document and --prompt together.")
 +
 +    request(args.url, "/health")
 +    report = {
@@ -758,14 +764,34 @@
 +        "tokens_requested": args.tokens,
 +        "runs": [],
 +    }
++    document_tokens = None
++    if args.document:
++        if report["server"]["default_generation_settings"]["n_ctx"] != 65536 or report["server"]["total_slots"] != 1:
++            parser.error("The document benchmark requires one slot with a 65536-token context.")
++        document = args.document.read_text(encoding="utf-8-sig")
++        question = args.prompt.read_text(encoding="utf-8-sig")
++        formatted = request(args.url, "/apply-template", {
++            "messages": [{"role": "user", "content": document + "\n\n" + question}],
++        })["prompt"]
++        document_tokens = request(args.url, "/tokenize", {"content": formatted, "parse_special": True})["tokens"]
++        if not document_tokens or len(document_tokens) + args.generate >= 65536:
++            parser.error("The complete document and generation must fit in the 64K context.")
++        report["tokens_requested"] = len(document_tokens)
++        report["document_sha256"] = hashlib.sha256(args.document.read_bytes()).hexdigest()
++        report["question_sha256"] = hashlib.sha256(args.prompt.read_bytes()).hexdigest()
++        report["workload"] = "document-chat-template"
 +    prose = "Explain how memory capacity, disk bandwidth, and transfer latency affect large language model inference. "
 +    for index in range(args.repetitions):
-+        # Change the start of every prompt so the server cannot reuse a previous KV prefix.
-+        prefix = (f"Independent benchmark {args.workload} {index}. " if args.workload else
-+                  f"Independent benchmark {args.label} {index} {time.time_ns()}. ")
-+        tokens = request(args.url, "/tokenize", {"content": prefix + prose * args.tokens})["tokens"][:args.tokens]
-+        if len(tokens) != args.tokens:
-+            raise RuntimeError("Tokenizer returned too few tokens.")
++        if document_tokens is not None:
++            tokens = document_tokens
++        else:
++            # Change the start of every synthetic prompt to prevent prefix reuse.
++            prefix = (f"Independent benchmark {args.workload} {index}. " if args.workload else
++                      f"Independent benchmark {args.label} {index} {time.time_ns()}. ")
++            tokens = request(args.url, "/tokenize", {"content": prefix + prose * args.tokens})["tokens"][:args.tokens]
++            if len(tokens) != args.tokens:
++                raise RuntimeError("Tokenizer returned too few tokens.")
++        print(f"Run {index + 1}/{args.repetitions}: {len(tokens)} prompt tokens, {args.generate} generated tokens.", flush=True)
 +        started = time.perf_counter()
 +        result = request(args.url, "/completion", {
 +            "prompt": tokens,
@@ -775,21 +801,20 @@
 +            "cache_prompt": False,
 +            "stream": False,
 +        })
-+        if result["timings"].get("cache_n", 0) != 0 or result["timings"]["prompt_n"] != args.tokens:
++        if result["timings"].get("cache_n", 0) != 0 or result["timings"]["prompt_n"] != len(tokens):
 +            raise RuntimeError("The server reused a prompt prefix or processed a different token count; discard this run.")
 +        run = {"wall_seconds": time.perf_counter() - started, "timings": result["timings"],
 +               "tokens_cached": result.get("tokens_cached"),
 +               "prompt_sha256": hashlib.sha256(json.dumps(tokens).encode()).hexdigest(),
 +               "response_sha256": hashlib.sha256(result.get("content", "").encode()).hexdigest()}
 +        report["runs"].append(run)
++        report["median_prompt_tokens_per_second"] = statistics.median(item["timings"]["prompt_per_second"] for item in report["runs"])
++        report["median_decode_tokens_per_second"] = statistics.median(item["timings"]["predicted_per_second"] for item in report["runs"])
 +        print(json.dumps(run), flush=True)
 +        output = args.output or Path(__file__).parent / f"results-{args.label}.json"
 +        output.write_text(json.dumps(report, indent=2), encoding="utf-8")
 +
-+    rates = [run["timings"]["prompt_per_second"] for run in report["runs"]]
-+    report["median_prompt_tokens_per_second"] = statistics.median(rates)
-+    output.write_text(json.dumps(report, indent=2), encoding="utf-8")
-+    print(f"Median prefill: {statistics.median(rates):.2f} tokens/s. Saved {output}")
++    print(f"Median prefill: {report['median_prompt_tokens_per_second']:.2f} tokens/s. Saved {output}")
 +
 +
 +if __name__ == "__main__":
@@ -846,40 +871,50 @@
 +    main()
 --- /dev/null
 +++ b/turbo64-16/README.md
-@@ -0,0 +1,151 @@
+@@ -0,0 +1,161 @@
 +# Turbo64-16
 +
 +Opt-in Windows optimization for MiMo-V2.6-Flash on Ryzen 7950X, 64 GB RAM, Gen5 NVMe, RTX 4080. Based on the supplied llama.cpp-b11475 source archive. Maintained independently of ggml-org/llama.cpp; no upstream submission is intended.
 +
-+V0.2 processed the user's 7,482-token prompt at **47.64 tokens/s**, up from **14.19 tokens/s** in the previous Turbo run (3.36x). Prompt time fell from 527.21 to 157.06 seconds. Decode was approximately unchanged at 3.11 versus 3.18 tokens/s, with different output lengths. This is one observed comparison with uncontrolled file-cache state. See [results](RESULTS.md) and the [short update log](CHANGELOG.md).
++The document benchmark uses `sample-doc.txt` and `sample-prompt.txt`, formatted by the model's chat template into 8,564 tokens. Two runs of the rebuilt prefill profile measured **90.48-112.66 tokens/s**, with a **101.57 tokens/s median**, compared with the initial **15.01 tokens/s** default and **42.55 tokens/s** previous prefill profile. It retains 65,536 context capacity and F16 KV, with KV stored in CPU RAM to make room for a 9,216-token microbatch. Decode's median was 1.54 tokens/s versus the starting 1.51. Windows file-cache state was uncontrolled; see [results](RESULTS.md) for all measurements and limitations.
 +
 +## Run
 +
 +From the source directory in Command Prompt:
 +
 +```bat
-+turbo64-16\run-server.cmd 2
++turbo64-16\run-server.cmd --turbo-prefill
 +```
 +
-+This uses the bespoke `turbo64-16\bin\llama-server.exe` and your original model, 64K context, `--n-cpu-moe 47`, 16 decode threads, 24 batch threads, batch 4096, microbatch 1024, Flash Attention, mmap, Jinja, and reasoning. It listens on all IPv4 interfaces (`0.0.0.0:5559`), including LAN. Stop any existing server on that port first. You can also run the bespoke executable without arguments to use the same model profile.
++This uses the bespoke `turbo64-16\bin\llama-server.exe` and your original model, 64K context, `--n-cpu-moe 47`, 16 decode threads, 24 batch threads, batch 16384, microbatch 9216, CPU F16 KV, Flash Attention, mmap, Jinja, and reasoning. It listens on all IPv4 interfaces (`0.0.0.0:5559`), including LAN. Stop any existing server on that port first. No-argument startup and `run-server.cmd 2` still select the original 1024 microbatch decode settings.
 +
 +Select a named profile directly on the packaged executable:
 +
 +```bat
 +turbo64-16\bin\llama-server.exe --turbo-prefill
++turbo64-16\bin\llama-server.exe --turbo-prefill2
++turbo64-16\bin\llama-server.exe --prefill-kv
 +turbo64-16\bin\llama-server.exe --turbo-decode
 +turbo64-16\bin\llama-server.exe --turbo-balanced
 +```
 +
-+| Flag | Microbatch | Purpose |
-+| --- | ---: | --- |
-+| `--turbo-prefill` | 4096 | Preserve the tested profile with the highest prompt-processing speed |
-+| `--turbo-decode` | 1024 | Use the tested smaller batch with the highest observed generation speed |
-+| `--turbo-balanced` | 2048 | Use an intermediate batch and memory footprint |
++| Flag | Batch | Microbatch | KV placement | Purpose |
++| --- | ---: | ---: | --- | --- |
++| `--turbo-prefill` | 16384 | 9216 | CPU, explicit F16 | Process the complete benchmark document in one large expert-transfer pass |
++| `--turbo-prefill2` | 4096 | 4096 | GPU, default F16 | Restore the prefill configuration from before the CPU-KV changes |
++| `--prefill-kv` | 16384 | 9216 | GPU, explicit Q8 K/V | Use the tested large-microbatch 64K GPU KV configuration |
++| `--turbo-decode` | 4096 | 1024 | GPU, default F16 | Retain the original generation profile |
++| `--turbo-balanced` | 4096 | 2048 | GPU, default F16 | Retain the intermediate batch and memory footprint |
 +
-+All three supply the same model, 64K context, CPU MoE 47, 16 decode/24 batch threads, batch 4096, Flash Attention, mmap, one slot, Jinja, reasoning, and default 128 MiB asynchronous read-ahead in mode 2. These are measured configuration choices, not guarantees across workloads or file-cache states. CPU prefetch is not included because the experiment slowed generation. CUDA graphs are unchanged.
++All five supply the same model, 64K context, CPU MoE 47, 16 decode/24 batch threads, Flash Attention, mmap, one slot, Jinja, reasoning, and default 128 MiB asynchronous read-ahead in mode 2. The CPU prefill profile adds `--no-kv-offload -ctk f16 -ctv f16`. The `--prefill-kv` preset adds `--kv-offload -ctk q8_0 -ctv q8_0`. These are measured configuration choices, not guarantees across workloads or file-cache states. CUDA graphs are unchanged.
 +
-+Choose only one profile per launch. Native options override its defaults, including aliases and negative options. For example, `llama-server.exe --turbo-prefill --ubatch-size 2048 --port 5560` changes microbatch and port. Existing environment overrides remain available. With no arguments the executable selects the decode profile; custom arguments without a profile retain the previous native-argument behavior. `--help` lists the profiles.
++Run the 64K GPU Q8 preset with `turbo64-16\run-server.cmd --prefill-kv`. Its configuration measured 117.68 tokens/s prefill and 3.12 tokens/s output in the earlier complete-document/512-token test. That run had 412 MiB minimum free dedicated VRAM, including desktop usage; see [the configuration matrix](bespoke-tests/2026-10-10-kv-context/SUMMARY.md) for memory measurements and file-cache limitations.
++
++The rebuilt named preset passed a full-document/512-token check at 101.75 tokens/s prefill and 3.12 tokens/s output, with the same input/output hashes as that earlier run. Native context, batch, microbatch, K/V type and negative placement overrides passed. See [preset validation](bespoke-tests/2026-10-10-prefill-kv/SUMMARY.md) for logs, memory samples and build details.
++
++Two full-document runs of the restored `--turbo-prefill2` profile measured 38.05-39.13 tokens/s prefill and 2.72-2.85 tokens/s output over 512 generated tokens, with medians of 38.59 and 2.78. Later output intervals measured about 3.1-3.3 tokens/s, while the complete output averages remained below 3. Run it with `turbo64-16\run-server.cmd --turbo-prefill2`; see RESULTS.md for the methodology and cache limitations.
++
++Choose only one profile per launch. Native options override its defaults, including aliases and negative options. For example, `llama-server.exe --turbo-prefill --ubatch-size 6144 --kv-offload` uses the tested 6144 microbatch with GPU KV. Select `--turbo-prefill2` to reproduce the previous prefill profile directly. Existing environment overrides remain available for read-ahead and diagnostics. With no arguments the executable selects the decode profile; custom arguments without a profile retain native-argument behavior. `--help` lists the profiles.
 +
 +The launcher also accepts these flags and forwards further server arguments: `turbo64-16\run-server.cmd --turbo-prefill`. The existing numeric mode and explicit microbatch syntax remains available.
 +
@@ -915,7 +950,7 @@
 +
 +```bat
 +set TURBO64_16_DIAGNOSTICS=0
-+turbo64-16\run-server.cmd 2
++turbo64-16\run-server.cmd --turbo-prefill
 +```
 +
 +The default logger then uses info verbosity. Set `LLAMA_ARG_LOG_VERBOSITY=4` for trace or `5` for debug. Set `LLAMA_ARG_LOG_FILE` to choose another file, or pass `--log-file`. Other native server arguments override the bespoke host/port/logging defaults. The full MiMo profile is supplied when no arguments are given or when a named Turbo profile is selected. Otherwise include `-m` and the model settings you want.
@@ -939,18 +974,18 @@
 +With the server running, in another terminal:
 +
 +```bat
-+py turbo64-16\benchmark.py --tokens 1024 --repetitions 3 --generate 32 --label turbo2
++py turbo64-16\benchmark.py --document turbo64-16\sample-doc.txt --prompt turbo64-16\sample-prompt.txt --repetitions 3 --generate 64 --label document-prefill
 +```
 +
-+Restart with `turbo64-16\run-server.cmd 0` and repeat with `--label original`. Use mode 1 and `--label turbo1` to isolate staging's contribution. Results are written to `turbo64-16\results-<label>.json`. Each prompt has a different prefix and disables caching; the script rejects reused prefixes. It records prompt processing, generation timing, wall time, server properties, and token counts, without saving generated message text. A allocated 64K context with a 1024-token prompt does not measure attention at a filled 64K context.
++Results are written to `turbo64-16\results-<label>.json`. The document mode reads both UTF-8 files in full, applies the model's chat template, and uses the exact same tokenized prompt in every run. It requires one 65536-token slot, disables prompt caching, and rejects any cached tokens or an incomplete prompt count. It records prefill/decode timing, wall time, server properties, token counts, and input/output hashes without saving conversation text. Allocating a 64K context with this 8564-token prompt does not measure attention at a filled 64K context.
 +
 +Repeat the same workload and include both initial and later runs. Windows file caching makes a single result noisy. Do not compare a cached prompt against an uncached one. Report prompt/generation speeds, dedicated/shared GPU memory from Task Manager, RAM use, and whether normal chat output looks correct. Do not run stock and Turbo simultaneously.
 +
-+Use `--workload <name>` with the same token count and repetition count across fresh server launches for repeatable synthetic A/B prompts. Reports include prompt and response SHA-256 hashes without storing conversation text. The existing cache checks still reject reused prefixes. This synthetic workload is not the user's workload from the supplied log.
++The older synthetic mode remains available with `--tokens` and `--workload <name>` for transfer sanity checks. It varies prompt prefixes and rejects reused prefixes. Use the document mode for performance changes as required by AGENTS.md.
 +
 +The pre-update executable and DLLs are preserved locally under `baseline-log-build/`; `run-server.cmd baseline` runs that build with the original 1024 microbatch. `run-server.cmd 2 2048` or `run-server.cmd 2 4096` chooses a microbatch explicitly. The baseline binaries are local artifacts and are not included in the source patch.
 +
-+The named profiles provide the tested 1024, 2048 and 4096 microbatch settings, keeping `-b 4096`. Larger microbatches amortize expert reads across more tokens but need more compute memory. The 4096 profile fit on this PC during the recorded tests. More desktop GPU usage or a different workload can change available headroom. Shared GPU usage includes CUDA host allocations and by itself does not prove device-memory spill; compare dedicated usage and throughput as well.
++The prefill profile's 9216 microbatch amortizes expert reads over the complete benchmark document; the larger logical batch also avoids a split at 4096 tokens. CPU KV placement releases persistent GPU KV storage while retaining F16 precision and 64K capacity. Observed total dedicated GPU memory was approximately 15,500 MiB including desktop applications, with limited headroom. More desktop GPU usage or a different workload can change available headroom. Shared GPU usage was not measured in these document runs. The GPU-KV 6144 alternative also used about 15,500 MiB and had faster decode in the initial sample. See RESULTS.md for exact figures.
 +
 +## Architecture and approach
 +
@@ -958,7 +993,7 @@
 +
 +On this machine, CPU expert repacking can allocate anonymous copies of mapped weights. Retaining ordinary CPU buffers lets weights remain file-backed and lets the existing scheduler offload supported prefill matmuls to CUDA. Decode still runs through the normal scheduler. This removes an expert-weight duplication path; it does not make the entire model fit in RAM or eliminate disk reads.
 +
-+The existing selected-expert copy callback supplies actual routing IDs. Turbo coalesces consecutive selected experts, preserves the original MMQ padding, prefetches bounded windows using the existing Windows helper, and uploads chunks of at most 32 MiB. Two pinned host buffers let the host prepare the next chunk while a previous transfer completes. Events prevent overwriting a buffer still in use by the GPU; destruction waits for pending transfers. Read-ahead overlaps the current window's staging and never predicts future-layer routing. There is no cross-layer GPU compute/copy pipeline, persistent GPU expert cache, model rewriting, or quantization change. CUDA graphs and CUDA kernel sources are unchanged.
++The existing selected-expert copy callback supplies actual routing IDs. Turbo coalesces consecutive selected experts, preserves the original MMQ padding, prefetches bounded windows using the existing Windows helper, and uploads chunks of at most 32 MiB. Two pinned host buffers let the host prepare the next chunk while a previous transfer completes. Events prevent overwriting a buffer still in use by the GPU; destruction waits for pending transfers. Read-ahead overlaps the current window's staging and never predicts future-layer routing. There is no cross-layer GPU compute/copy pipeline, persistent GPU expert cache, model rewriting, or model-weight quantization change. CUDA graphs and CUDA kernel sources are unchanged.
 +
 +Sources:
 +
@@ -1000,10 +1035,65 @@
 +Measured results and limitations are recorded in `RESULTS.md`.
 --- /dev/null
 +++ b/turbo64-16/RESULTS.md
-@@ -0,0 +1,129 @@
+@@ -0,0 +1,210 @@
 +# Local validation results
 +
 +Date: 2026-10-07. Windows 11, Ryzen 7950X, 64 GB RAM, RTX 4080, driver 610.74. Supplied source: llama.cpp-b11475 archive, no Git metadata. Release build: MSVC 19.44.35228, CUDA 12.8, sm_89, native CPU instructions.
++
++## 2026-10-10: restored prefill2 profile
++
++Added `--turbo-prefill2` with the settings used before the CPU-KV prefill update: batch 4096, microbatch 4096, GPU F16 KV, 65536 context capacity, CPU MoE 47, 16 decode/24 batch threads, Flash Attention, mmap, one slot, Jinja, reasoning, mode 2, and asynchronous 128 MiB read-ahead. The existing prefill, decode and balanced profiles remain available; no-argument startup still selects decode. CUDA graphs and kernel sources were not changed.
++
++The rebuilt packaged executable ran two complete requests using `sample-doc.txt` and `sample-prompt.txt`, the same chat template and 8564-token prompt hash as the earlier tests, greedy sampling, seed 1234, and 512 generated tokens per request. Diagnostics and startup warmup were disabled. Both requests processed all 8564 tokens with `cache_n=0` and produced identical 512-token response hashes: `6a860c627aabf4affb52b1196f2e5ff6826cbb9c15a565f4fe3e561edc46c9d1`.
++
++| Restored profile | Prefill tokens/s | Prompt seconds | Output tokens/s | Generated tokens |
++| --- | ---: | ---: | ---: | ---: |
++| First request | 39.13 | 218.881 | 2.72 | 512 |
++| Second request | 38.05 | 225.068 | 2.85 | 512 |
++| Median | 38.59 | 221.974 | 2.78 | 512 |
++
++These runs support approximately 40 tokens/s prefill. The complete output averages were below 3 tokens/s, while later generation intervals reached approximately 3 tokens/s. Wall-clock `/slots` observations measured 3.08 tokens/s across tokens 147-441 in the first request (95.50 seconds), and 3.31 tokens/s across tokens 204-444 in the second (72.61 seconds). These interval measurements exclude the slower initial generation and must not replace the complete native timing averages. The longer 512-token output differs from the earlier 64-token benchmarks; output rates are not a matched before/after speedup comparison. Windows file-cache state was uncontrolled, and 64K capacity was allocated while only the benchmark document and generated tokens were populated.
++
++Logs confirmed `profile=prefill2`, both batch sizes at 4096, context 65536, GPU F16 global/SWA KV allocations of 1440.00/828.75 MiB, Flash Attention enabled, and 128 MiB asynchronous read-ahead. Build/package, launcher forwarding/help, conflicting-profile rejection, preserved-profile/default selection, ASCII/whitespace and patch checks passed. The benchmark server was stopped after testing. Raw evidence: `results-prefill2-restored-pp8564-tg512.json`, `prefill2-restore.stderr.log`, and `prefill2-restore-progress.json`.
++
++Run the restored profile with `turbo64-16\run-server.cmd --turbo-prefill2`. For the benchmark, set `TURBO64_16_DIAGNOSTICS=0` and use `benchmark.py --document turbo64-16/sample-doc.txt --prompt turbo64-16/sample-prompt.txt --repetitions 2 --generate 512 --label prefill2-restored`.
++
++## 2026-10-10: complete document prefill
++
++Measured the starting packaged executable before changing performance settings, using the complete `sample-doc.txt` followed by `sample-prompt.txt` in one user message. The server's `/apply-template` and `/tokenize` endpoints produced 8,564 tokens; the exact token hash was `df4676a58139a24751179b34211264b6cad603816c8aee7503abe985bb4999a3` in every completed run. `/completion` used 64 greedy generated tokens, seed 1234, and `cache_prompt=false`. All completed runs processed exactly 8,564 tokens with `cache_n=0`.
++
++All configurations used the same local MiMo GGUF, 65,536 context capacity, one slot, F16 keys and values, Flash Attention, mmap, GPU layers all, CPU MoE 47, 16 decode/24 batch threads, mode 2, and asynchronous 128 MiB read-ahead. Diagnostics and startup warmup were disabled. The initial default-profile run used info verbosity 3; later runs used 4 to capture technical configuration and timing logs. CUDA graphs, kernels, model weights, and expert routing code were not modified.
++
++| Initial configuration | Logical batch | Microbatch | KV placement | Prefill tokens/s | Prompt seconds | Decode tokens/s |
++| --- | ---: | ---: | --- | ---: | ---: | ---: |
++| Starting default/decode profile | 4096 | 1024 | GPU F16 | 15.01 | 570.715 | 1.51 |
++| Previous prefill profile | 4096 | 4096 | GPU F16 | 42.55 | 201.254 | 1.63 |
++| Larger GPU-KV microbatch | 16384 | 6144 | GPU F16 | 58.10 | 147.400 | 1.86 |
++| Complete-document microbatch | 16384 | 9216 | CPU F16 | 113.08 | 75.737 | 1.28 |
++
++The initial 9216 result was 7.54x the starting default and 2.66x the previous prefill profile. Prompt time fell 86.7% versus the starting default. Decode was about 15% slower than the starting default in this sample; this change prioritizes prefill only. CPU KV placement is not KV quantization. It frees persistent GPU KV storage for a larger compute batch, with additional CPU/GPU transfers and host memory use. The prefill consists of one 8560-token expert-transfer pass plus a separate four-token checkpoint tail. The previous 4096 profile used 4096, 372 and 4092-token passes plus the same tail.
++
++After rebuilding, a fresh process was launched with `--turbo-prefill --host 127.0.0.1 --port 5558 --no-warmup`, without batch or KV overrides. Allocation logs confirmed the intended batch, microbatch, context, and CPU F16 KV settings. Both full-document repetitions had `cache_n=0` and the same response hash as the earlier 9216 run, `7686bd0702f7767cfddc8c6c0979fd2168018af7ec7abef6bde720c27a9ca421`.
++
++| Rebuilt named profile | Prefill tokens/s | Prompt seconds | Decode tokens/s |
++| --- | ---: | ---: | ---: |
++| First request | 112.66 | 76.018 | 1.48 |
++| Second request | 90.48 | 94.647 | 1.61 |
++| Median of these two requests | 101.57 | 85.333 | 1.54 |
++
++The repeated profile's median prefill rate was 6.77x the starting default and 2.39x the initial previous-prefill run. Median prompt time fell about 85.0% versus the starting default. The approximately 20% rate variation between requests is material; the initial 113.08 result is not a guaranteed sustained rate. Decode was approximately unchanged versus the starting default in these short samples and was not optimized. Evidence: `results-document-prefill-final.json` and `document-prefill-final.stderr.log`.
++
++A final fresh-process run used `--turbo-prefill --batch-size 4096 --ubatch-size 4096 --kv-offload` to restore the previous prefill configuration on the rebuilt executable. Logs confirmed both batch sizes were 4096 and both KV allocations were GPU F16 with 65536 context capacity. It measured 41.27 tokens/s prefill in 207.513 seconds and 1.99 tokens/s decode, with no cached tokens and the same response hash as the initial previous-profile run. The previous profile's two-run medians were 41.91 tokens/s prefill and 1.81 tokens/s decode. The updated preset was 2.42x faster in prefill, with about 15% lower decode throughput than the previous prefill profile. These comparisons remain subject to file-cache and output differences. Evidence: `results-document-ub4096-repeat.json` and `document-ub4096-repeat.stderr.log`.
++
++The 256 MiB read-ahead experiment was interrupted when VS Code closed, before generation and the final JSON report completed. Its main 8560-token block took 134.68 seconds, versus 71.13 seconds with 128 MiB read-ahead. This partial timing does not supply a final prefill/decode rate; 256 MiB was rejected and the 128 MiB default was retained. Previously completed JSON reports and source edits survived the interruption.
++
++Observed total dedicated GPU memory including desktop applications was about 13,100-13,300 MiB for the default, 14,500 MiB for the previous prefill profile, and 15,500-15,700 MiB for the larger configurations. The final CPU-KV profile allocates 1440.00 MiB global KV and 1803.75 MiB sliding-window KV in CPU RAM, a 6029.11 MiB CUDA compute buffer, and a 2083.91 MiB CUDA host compute buffer. Dedicated/shared memory per process and peak memory were not measured. Desktop GPU use limits headroom.
++
++Windows file caching was not reset or controlled between runs. These are sequential local observations, not a controlled speedup guarantee. Only 8564 prompt tokens were populated; the full 64K capacity was verified in `/props` and allocation logs, but performance at 64K populated tokens was not tested. Initial default and previous-prefill response hashes matched over 64 tokens; 6144 and 9216 hashes differed. Full-model perplexity, final-answer quality, and token-equivalent outputs across microbatches are not established.
++
++The new `--turbo-prefill` profile supplies batch 16384, microbatch 9216, `--no-kv-offload`, and explicit F16 KV. Decode, balanced, and no-argument settings retain their previous defaults. Native aliases and positive KV-offload options can replace profile defaults, as verified by the final comparison run. Rebuilding and packaging passed; all 14 mode-2 transfer cases passed byte-exactly, and the metadata-only logging regression passed. Conflicting profiles were rejected and the launcher forwarded profile help correctly. The Python benchmark now supports paired `--document` and `--prompt` paths, rejects a context other than one 65536-token slot, and saves both median prefill and decode rates after each completed request without saving conversation text. Python syntax and changed-file ASCII/whitespace checks passed; the CI-pinned `ty` checker was unavailable in the local Python environment and could not be installed from the configured package index. Benchmark servers were stopped after validation.
++
++Initial raw reports: `results-document-baseline-ub1024.json`, `results-document-ub4096.json`, `results-document-ub6144.json`, and `results-document-ub9216-cpukv.json`. Configuration and timing evidence is in the corresponding `document-*.stderr.log` files. All artifacts remain local.
 +
 +## V0.2: user 7,482-token workload
 +
@@ -1130,9 +1220,50 @@
 +An API check using the real model passed for normal chat (HTTP 200), streaming chat (HTTP 200 with completed SSE), and malformed JSON (HTTP 400). With `--verbose --log-jsonl`, request canaries and generated message/reasoning text were absent from terminal captures and the saved log. Hardware, HTTP metadata, and prompt timing records remained. The test report stores status codes and token usage only, without chat contents: `privacy-api-check.json`.
 +
 +Earlier API smoke tests and older log/result files described above predate this policy and have not been scrubbed. The updated policy applies to the bespoke executable, including Turbo mode 0. Other binaries retain their normal logging unless they explicitly install a metadata-only filter.
++
++## 2026-10-10: KV/context matrix (tests only)
++
++Completed 18 uncached full-document requests across 12 requested variants and one existing CPU-KV reference. Every request used sample-doc.txt plus sample-prompt.txt, the same chat template and 8564-token prompt hash, with 32K or 64K allocated capacity. The initial matrix generated 64 tokens; five confirmations generated 512 tokens. Diagnostics were enabled consistently in the fresh baselines and variants. CPU-only commands used -ngl 0 --device none --no-op-offload, with zero GPU layers/compute buffers confirmed. No profiles, server code, or CUDA graphs were changed.
++
++| 512-token confirmation | Batch / microbatch | Prefill t/s | Decode t/s | Minimum sampled free VRAM MiB |
++| --- | ---: | ---: | ---: | ---: |
++| GPU KV, 64K F16 | 4096 / 4096 | 40.16 | 2.74 | 2153 |
++| GPU KV, 64K Q8 | 4096 / 4096 | 40.88 | 2.76 | 3217 |
++| GPU KV, 64K Q8 | 16384 / 9216 | 117.68 | 3.12 | 412 |
++| GPU KV, 32K Q8 | 16384 / 9216 | 118.85 | 3.03 | 1368 |
++| CPU-only, 32K F16 | 4096 / 4096 | 20.08 | 1.91 | 15204 |
++
++64K Q8 at the original batch saved about 1064 MiB of sampled dedicated headroom with approximately unchanged throughput. Both larger Q8 GPU cases reached about 118 t/s prefill and 3.0-3.1 t/s decode; 32K Q8 left more free VRAM than 64K Q8 at that batch. CPU-only F16 prefill was faster than CPU-only Q8 in the initial matrix, but the entire model remains disk-backed because it exceeds RAM. Host staging consumed roughly 77-82% of the confirmed GPU prefill time, and all cases reached 99% RAM load. Raw logs retain per-tensor transfers, hardware observations, disk/page-input counters, and dedicated/shared GPU allocations for later investigation; no bottlenecks were fixed.
++
++Windows file cache and background activity were uncontrolled; repeated prefill varied materially. Capacity was allocated but only the document and generated tokens were populated. Output hashes differ across some variants, and output quality was not evaluated. All test servers were stopped. Full tables, exact commands, limitations, validation, and matching raw-log folders: [local benchmark summary](bespoke-tests/2026-10-10-kv-context/SUMMARY.md).
++
++## 2026-10-10: --prefill-kv preset validation
++
++Added the requested preset using the tested large-batch GPU configuration: 65536 context, q8_0 K/V on GPU, batch 16384 and microbatch 9216. The packaged executable and run-server.cmd accept --prefill-kv. Existing profiles and no-argument decode selection remain available.
++
++The named preset processed the complete sample-doc.txt plus sample-prompt.txt without KV/batch/context arguments supplied separately: 8564 prompt tokens, zero cache reuse and 512 generated tokens. Prefill measured 101.75 tokens/s and decode 3.12 tokens/s. Input, formatted-prompt and output hashes matched the earlier explicit configuration's 117.68/3.12 t/s run. Diagnostics were enabled at trace verbosity in both; Windows file-cache state and background usage were uncontrolled.
++
++Native long aliases and the negative KV option successfully overrode context, batch, microbatch, both KV types and placement, verified through actual model allocations. Profile and launcher help, conflicting-profile rejection and the existing privacy regression passed. Inputs and ggml-cuda.dll were unchanged, CUDA graphs were untouched, and both test servers were stopped. The executable was rebuilt and packaged using the existing generated compile/link commands after the normal Ninja build stalled; no build-system or performance bottleneck fixes were made.
++
++Measured memory, exact commands, native logs, GPU samples and Windows RAM/disk/page-input/dedicated/shared-memory counters are retained in matching folders: [preset results summary](bespoke-tests/2026-10-10-prefill-kv/SUMMARY.md).
 --- /dev/null
 +++ b/turbo64-16/CHANGELOG.md
-@@ -0,0 +1,7 @@
+@@ -0,0 +1,22 @@
++# Turbo64-16 v0.2.1 - 2026-10-10
++
++- Added `--prefill-kv`: 65536 context, GPU Q8 K/V, batch 16384, microbatch 9216, and the existing MiMo model and thread settings.
++- Available through the packaged executable and `run-server.cmd`, with native CLI overrides. Existing profiles, no-argument startup, and CUDA graphs are unchanged.
++- Named-preset validation with the complete benchmark document and 512 output tokens measured 101.75 tokens/s prefill and 3.12 tokens/s decode. Input/output hashes matched the earlier explicit configuration; native alias/negative overrides and privacy regression passed.
++
++# Local prefill update - 2026-10-10
++
++- Added `--turbo-prefill2` with the previous batch/microbatch 4096 and GPU F16 KV settings. Existing profiles remain available.
++- Restored-profile medians over two complete document/512-token output requests: prefill 38.59 tokens/s, output 2.78 tokens/s. Later output intervals reached 3.1-3.3 tokens/s; complete output averages were below 3.
++- Measured the full 8564-token document before changing settings: default prefill 15.01 tokens/s, decode 1.51 tokens/s; previous prefill profile 42.55 tokens/s.
++- Updated `--turbo-prefill` to batch 16384, microbatch 9216, and CPU F16 KV, retaining 65536 context capacity and CUDA graphs.
++- Rebuilt-profile prefill: 90.48-112.66 tokens/s, median 101.57 (6.77x the starting default); median decode 1.54 tokens/s. File-cache state was uncontrolled.
++- Added complete-document benchmarks with cache/count checks and incremental median reports. Build, byte-exact transfer, privacy, and repeated model checks passed.
++
 +# Turbo64-16 V0.2
 +
 +- Prefill on the 7,482-token workload: 14.19 to 47.64 tokens/s (3.36x); prompt time 527.21 to 157.06 seconds.
@@ -1165,7 +1296,7 @@
 +    VERBATIM)
 --- /dev/null
 +++ b/turbo64-16/server-main.cpp
-@@ -0,0 +1,283 @@
+@@ -0,0 +1,301 @@
 +#include "arg.h"
 +#include "log.h"
 +#include "private-logs.h"
@@ -1228,22 +1359,29 @@
 +struct turbo_profile {
 +    const char * flag;
 +    const char * name;
++    const char * batch;
 +    const char * microbatch;
++    const char * kv_offload;
++    const char * kv_type;
 +};
 +
 +static const turbo_profile profiles[] = {
-+    {"--turbo-prefill",  "prefill",  "4096"},
-+    {"--turbo-decode",   "decode",   "1024"},
-+    {"--turbo-balanced", "balanced", "2048"},
++    {"--turbo-prefill",  "prefill",  "16384", "9216", "--no-kv-offload", "f16"},
++    {"--turbo-decode",   "decode",   "4096",  "1024", nullptr, nullptr},
++    {"--turbo-balanced", "balanced", "4096",  "2048", nullptr, nullptr},
++    {"--turbo-prefill2", "prefill2", "4096",  "4096", nullptr, nullptr},
++    {"--prefill-kv",     "prefill-kv", "16384", "9216", "--kv-offload", "q8_0"},
 +};
 +
 +static void print_profiles() {
 +    std::fputs("\nTurbo64-16 profiles (select one; native arguments override profile defaults):\n"
-+               "  --turbo-prefill   Prioritize prompt processing; microbatch 4096.\n"
++               "  --turbo-prefill   Prioritize prompt processing; batch 16384, microbatch 9216, CPU F16 KV.\n"
++               "  --turbo-prefill2  Restore the previous prefill settings; batch/microbatch 4096, GPU F16 KV.\n"
++               "  --prefill-kv      Use 64K GPU Q8 K/V; batch 16384, microbatch 9216.\n"
 +               "  --turbo-decode    Prioritize generation; microbatch 1024.\n"
 +               "  --turbo-balanced Use an intermediate microbatch of 2048.\n"
 +               "All profiles use the local MiMo model, 64K context, CPU MoE 47, 16/24 threads,\n"
-+               "batch 4096, Flash Attention, mmap, one slot, Jinja and reasoning.\n"
++               "Flash Attention, mmap, one slot, Jinja and reasoning. Decode/balanced/prefill2 use batch 4096.\n"
 +               "No arguments selects --turbo-decode. Custom arguments without a profile retain native defaults.\n\n", stderr);
 +}
 +
@@ -1420,7 +1558,7 @@
 +        const char * defaults[][2] = {
 +            {"-m", "C:/Users/Tudi/Documents/Tudi/AI/MiMo-V2.6-Flash-MOPD-Q2_K-00001-of-00002.gguf"},
 +            {"-c", "65536"}, {"-ngl", "all"}, {"--n-cpu-moe", "47"}, {"-t", "16"}, {"-tb", "24"},
-+            {"-b", "4096"}, {"-ub", profile->microbatch}, {"-fa", "on"}, {"-lm", "mmap"},
++            {"-b", profile->batch}, {"-ub", profile->microbatch}, {"-fa", "on"}, {"-lm", "mmap"},
 +            {"-np", "1"}, {"--reasoning", "on"},
 +        };
 +        for (const auto & setting : defaults) {
@@ -1429,6 +1567,17 @@
 +            }
 +            arguments.emplace_back(setting[0]);
 +            arguments.emplace_back(setting[1]);
++        }
++        if (profile->kv_offload && !specified.count(profile->kv_offload)) {
++            arguments.emplace_back(profile->kv_offload);
++        }
++        if (profile->kv_type) {
++            for (const char * option : {"-ctk", "-ctv"}) {
++                if (!specified.count(option)) {
++                    arguments.emplace_back(option);
++                    arguments.emplace_back(profile->kv_type);
++                }
++            }
 +        }
 +        set_default("TURBO64_16_READAHEAD_ASYNC", "1");
 +        set_default("TURBO64_16_READAHEAD_MIB", "128");

@@ -1,0 +1,157 @@
+{
+  "started_utc": "2026-10-09T22:44:56.327929+00:00",
+  "timezone": "Europe/Bucharest",
+  "configs": [
+    {
+      "name": "gpu-ctx65536-kvf16-b4096-ub4096",
+      "ctx": 65536,
+      "kv": "f16",
+      "batch": 4096,
+      "microbatch": 4096,
+      "placement": "gpu"
+    },
+    {
+      "name": "gpu-ctx65536-kvq8_0-b4096-ub4096",
+      "ctx": 65536,
+      "kv": "q8_0",
+      "batch": 4096,
+      "microbatch": 4096,
+      "placement": "gpu"
+    },
+    {
+      "name": "gpu-ctx32768-kvf16-b4096-ub4096",
+      "ctx": 32768,
+      "kv": "f16",
+      "batch": 4096,
+      "microbatch": 4096,
+      "placement": "gpu"
+    },
+    {
+      "name": "gpu-ctx32768-kvq8_0-b4096-ub4096",
+      "ctx": 32768,
+      "kv": "q8_0",
+      "batch": 4096,
+      "microbatch": 4096,
+      "placement": "gpu"
+    },
+    {
+      "name": "reference-cpu-kv-ctx65536-kvf16-b16384-ub9216",
+      "ctx": 65536,
+      "kv": "f16",
+      "batch": 16384,
+      "microbatch": 9216,
+      "placement": "cpu-kv"
+    },
+    {
+      "name": "gpu-ctx65536-kvf16-b16384-ub9216",
+      "ctx": 65536,
+      "kv": "f16",
+      "batch": 16384,
+      "microbatch": 9216,
+      "placement": "gpu"
+    },
+    {
+      "name": "gpu-ctx65536-kvq8_0-b16384-ub9216",
+      "ctx": 65536,
+      "kv": "q8_0",
+      "batch": 16384,
+      "microbatch": 9216,
+      "placement": "gpu"
+    },
+    {
+      "name": "gpu-ctx32768-kvf16-b16384-ub9216",
+      "ctx": 32768,
+      "kv": "f16",
+      "batch": 16384,
+      "microbatch": 9216,
+      "placement": "gpu"
+    },
+    {
+      "name": "gpu-ctx32768-kvq8_0-b16384-ub9216",
+      "ctx": 32768,
+      "kv": "q8_0",
+      "batch": 16384,
+      "microbatch": 9216,
+      "placement": "gpu"
+    },
+    {
+      "name": "cpu-only-ctx65536-kvf16-b4096-ub4096",
+      "ctx": 65536,
+      "kv": "f16",
+      "batch": 4096,
+      "microbatch": 4096,
+      "placement": "cpu-only"
+    },
+    {
+      "name": "cpu-only-ctx65536-kvq8_0-b4096-ub4096",
+      "ctx": 65536,
+      "kv": "q8_0",
+      "batch": 4096,
+      "microbatch": 4096,
+      "placement": "cpu-only"
+    },
+    {
+      "name": "cpu-only-ctx32768-kvf16-b4096-ub4096",
+      "ctx": 32768,
+      "kv": "f16",
+      "batch": 4096,
+      "microbatch": 4096,
+      "placement": "cpu-only"
+    },
+    {
+      "name": "cpu-only-ctx32768-kvq8_0-b4096-ub4096",
+      "ctx": 32768,
+      "kv": "q8_0",
+      "batch": 4096,
+      "microbatch": 4096,
+      "placement": "cpu-only"
+    }
+  ],
+  "method": "Complete document + question in one user message; model chat template; no cached tokens; greedy; seed 1234; 64-token initial matrix; diagnostic timers enabled for every new run; sequential fresh processes; Windows file cache uncontrolled.",
+  "input_and_binary_sha256": {
+    "turbo64-16\\sample-doc.txt": "e62d51f2fb9daa6623051a2022215a78988bb954fd0a6aa4acbc67f1f6db8e5b",
+    "turbo64-16\\sample-prompt.txt": "8a09a17f642bde389e13f106c2fb0571711af176abdb3b7529a2db88e0d0df7b",
+    "turbo64-16\\benchmark.py": "f5dba80848dc32f3392ce0325faa1f8e1f59ffdc6a8e0e1e0643f93f361ffdf7",
+    "turbo64-16\\bin\\ggml-base.dll": "625f17833df5fc02d8ade614cbb7e5f45c29dee98855fa01cab475877197f874",
+    "turbo64-16\\bin\\ggml-cpu.dll": "00526453b2e8a845ab1d98c085325bc62f667bd65292c29eccbe98d85e86edeb",
+    "turbo64-16\\bin\\ggml-cuda.dll": "d2098a2d131c1f8d986fb46ca53dad484cfb13198403929d1ccb158657b2ce0d",
+    "turbo64-16\\bin\\ggml.dll": "121ea4ed475318a478e69250c073fd2c5404533579084c8fd99ce28cd8bc2f8d",
+    "turbo64-16\\bin\\llama-bench-impl.dll": "d96be700f1a1d9b4a44267b44ad882523a0d498ae8a6b3c901a1d76d2325dd13",
+    "turbo64-16\\bin\\llama-common.dll": "bf87e7f4c91e22b10a8cd8a447942c6f8719f719508132ed5fc9cadb54182b61",
+    "turbo64-16\\bin\\llama-server-impl.dll": "aa32060feb7b682ccbeee3c5d86f4eca741dde87520b898c8d2e02ca8ec6c7cc",
+    "turbo64-16\\bin\\llama.dll": "de4e89fa25e0fb79ed5c9543952e2ad504b6aaae25d60efba1f2dac62146cfe2",
+    "turbo64-16\\bin\\mtmd.dll": "37a9bea8c02180e08a5c5f945a0ebf6e310c646cd1f17c3398d9b5aa63bff7c1",
+    "turbo64-16\\bin\\llama-server.exe": "7e65f2832193b34c108c6af01845554065543a51f9f54149b600ae719887dc7a"
+  },
+  "model_files": [
+    {
+      "path": "C:\\Users\\Tudi\\Documents\\Tudi\\AI\\MiMo-V2.6-Flash-MOPD-Q2_K-00001-of-00002.gguf",
+      "bytes": 5948928,
+      "mtime_ns": 1791369441772075200
+    },
+    {
+      "path": "C:\\Users\\Tudi\\Documents\\Tudi\\AI\\MiMo-V2.6-Flash-MOPD-Q2_K-00002-of-00002.gguf",
+      "bytes": 126208645216,
+      "mtime_ns": 1791374203520304700
+    }
+  ],
+  "prior_baselines": [
+    "turbo64-16/results-prefill2-restored-pp8564-tg512.json",
+    "turbo64-16/results-document-prefill-final.json"
+  ],
+  "benchmark_copy": "Original benchmark copied locally with only the 32K/64K context validation generalized; source benchmark untouched.",
+  "planned_confirmation": {
+    "phase": "confirm-tg512",
+    "generate": 512,
+    "repetitions": 1,
+    "configs": [
+      "gpu-ctx65536-kvf16-b4096-ub4096",
+      "gpu-ctx65536-kvq8_0-b16384-ub9216",
+      "gpu-ctx32768-kvq8_0-b16384-ub9216",
+      "cpu-only-ctx32768-kvf16-b4096-ub4096",
+      "gpu-ctx65536-kvq8_0-b4096-ub4096"
+    ],
+    "purpose": "Matched longer-output decode comparison and a second uncached prefill observation; output lengths kept separate in reporting.",
+    "additional_purpose": "Keep the original 4096 batch while quantizing only the 64K KV cache, for a matched 512-token decode and headroom comparison."
+  }
+}

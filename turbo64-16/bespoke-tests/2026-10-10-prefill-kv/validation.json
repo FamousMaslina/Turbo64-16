@@ -1,0 +1,11 @@
+{
+  "cli_and_launcher": "passed",
+  "conflicting_profiles_rejected": true,
+  "privacy_regression": "passed",
+  "inputs_and_cuda_dll_unchanged": {
+    "turbo64-16/sample-doc.txt": true,
+    "turbo64-16/sample-prompt.txt": true,
+    "turbo64-16/bin/ggml-cuda.dll": true
+  },
+  "source_patch_apply_and_hash_check": "passed"
+}

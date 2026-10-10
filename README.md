@@ -7,6 +7,18 @@ This project was fully vibe coded and built entirely to serve my own needs and h
 
 See [Turbo64-16 build, launch, API, and update instructions](turbo64-16/README.md) and [validation results](turbo64-16/RESULTS.md).
 
+## v0.2.1 update
+
+- Added `--prefill-kv`: 64K context, GPU Q8 K/V, batch 16384 and microbatch 9216.
+- Full-document validation measured 101.75 tokens/s prefill and 3.12 tokens/s decode over 512 output tokens. File-cache state was uncontrolled.
+- Existing profiles remain available, including `--turbo-prefill2` for the previous GPU F16 settings. CUDA graphs are unchanged.
+
+```bat
+turbo64-16\run-server.cmd --prefill-kv
+```
+
+This is a source release; build instructions and benchmark summaries are linked above.
+
 ## V0.2 update
 
 - Added `--turbo-prefill`, `--turbo-decode` and `--turbo-balanced` profiles with native argument overrides.

@@ -2,6 +2,61 @@
 
 Date: 2026-10-07. Windows 11, Ryzen 7950X, 64 GB RAM, RTX 4080, driver 610.74. Supplied source: llama.cpp-b11475 archive, no Git metadata. Release build: MSVC 19.44.35228, CUDA 12.8, sm_89, native CPU instructions.
 
+## 2026-10-10: restored prefill2 profile
+
+Added `--turbo-prefill2` with the settings used before the CPU-KV prefill update: batch 4096, microbatch 4096, GPU F16 KV, 65536 context capacity, CPU MoE 47, 16 decode/24 batch threads, Flash Attention, mmap, one slot, Jinja, reasoning, mode 2, and asynchronous 128 MiB read-ahead. The existing prefill, decode and balanced profiles remain available; no-argument startup still selects decode. CUDA graphs and kernel sources were not changed.
+
+The rebuilt packaged executable ran two complete requests using `sample-doc.txt` and `sample-prompt.txt`, the same chat template and 8564-token prompt hash as the earlier tests, greedy sampling, seed 1234, and 512 generated tokens per request. Diagnostics and startup warmup were disabled. Both requests processed all 8564 tokens with `cache_n=0` and produced identical 512-token response hashes: `6a860c627aabf4affb52b1196f2e5ff6826cbb9c15a565f4fe3e561edc46c9d1`.
+
+| Restored profile | Prefill tokens/s | Prompt seconds | Output tokens/s | Generated tokens |
+| --- | ---: | ---: | ---: | ---: |
+| First request | 39.13 | 218.881 | 2.72 | 512 |
+| Second request | 38.05 | 225.068 | 2.85 | 512 |
+| Median | 38.59 | 221.974 | 2.78 | 512 |
+
+These runs support approximately 40 tokens/s prefill. The complete output averages were below 3 tokens/s, while later generation intervals reached approximately 3 tokens/s. Wall-clock `/slots` observations measured 3.08 tokens/s across tokens 147-441 in the first request (95.50 seconds), and 3.31 tokens/s across tokens 204-444 in the second (72.61 seconds). These interval measurements exclude the slower initial generation and must not replace the complete native timing averages. The longer 512-token output differs from the earlier 64-token benchmarks; output rates are not a matched before/after speedup comparison. Windows file-cache state was uncontrolled, and 64K capacity was allocated while only the benchmark document and generated tokens were populated.
+
+Logs confirmed `profile=prefill2`, both batch sizes at 4096, context 65536, GPU F16 global/SWA KV allocations of 1440.00/828.75 MiB, Flash Attention enabled, and 128 MiB asynchronous read-ahead. Build/package, launcher forwarding/help, conflicting-profile rejection, preserved-profile/default selection, ASCII/whitespace and patch checks passed. The benchmark server was stopped after testing. Raw evidence: `results-prefill2-restored-pp8564-tg512.json`, `prefill2-restore.stderr.log`, and `prefill2-restore-progress.json`.
+
+Run the restored profile with `turbo64-16\run-server.cmd --turbo-prefill2`. For the benchmark, set `TURBO64_16_DIAGNOSTICS=0` and use `benchmark.py --document turbo64-16/sample-doc.txt --prompt turbo64-16/sample-prompt.txt --repetitions 2 --generate 512 --label prefill2-restored`.
+
+## 2026-10-10: complete document prefill
+
+Measured the starting packaged executable before changing performance settings, using the complete `sample-doc.txt` followed by `sample-prompt.txt` in one user message. The server's `/apply-template` and `/tokenize` endpoints produced 8,564 tokens; the exact token hash was `df4676a58139a24751179b34211264b6cad603816c8aee7503abe985bb4999a3` in every completed run. `/completion` used 64 greedy generated tokens, seed 1234, and `cache_prompt=false`. All completed runs processed exactly 8,564 tokens with `cache_n=0`.
+
+All configurations used the same local MiMo GGUF, 65,536 context capacity, one slot, F16 keys and values, Flash Attention, mmap, GPU layers all, CPU MoE 47, 16 decode/24 batch threads, mode 2, and asynchronous 128 MiB read-ahead. Diagnostics and startup warmup were disabled. The initial default-profile run used info verbosity 3; later runs used 4 to capture technical configuration and timing logs. CUDA graphs, kernels, model weights, and expert routing code were not modified.
+
+| Initial configuration | Logical batch | Microbatch | KV placement | Prefill tokens/s | Prompt seconds | Decode tokens/s |
+| --- | ---: | ---: | --- | ---: | ---: | ---: |
+| Starting default/decode profile | 4096 | 1024 | GPU F16 | 15.01 | 570.715 | 1.51 |
+| Previous prefill profile | 4096 | 4096 | GPU F16 | 42.55 | 201.254 | 1.63 |
+| Larger GPU-KV microbatch | 16384 | 6144 | GPU F16 | 58.10 | 147.400 | 1.86 |
+| Complete-document microbatch | 16384 | 9216 | CPU F16 | 113.08 | 75.737 | 1.28 |
+
+The initial 9216 result was 7.54x the starting default and 2.66x the previous prefill profile. Prompt time fell 86.7% versus the starting default. Decode was about 15% slower than the starting default in this sample; this change prioritizes prefill only. CPU KV placement is not KV quantization. It frees persistent GPU KV storage for a larger compute batch, with additional CPU/GPU transfers and host memory use. The prefill consists of one 8560-token expert-transfer pass plus a separate four-token checkpoint tail. The previous 4096 profile used 4096, 372 and 4092-token passes plus the same tail.
+
+After rebuilding, a fresh process was launched with `--turbo-prefill --host 127.0.0.1 --port 5558 --no-warmup`, without batch or KV overrides. Allocation logs confirmed the intended batch, microbatch, context, and CPU F16 KV settings. Both full-document repetitions had `cache_n=0` and the same response hash as the earlier 9216 run, `7686bd0702f7767cfddc8c6c0979fd2168018af7ec7abef6bde720c27a9ca421`.
+
+| Rebuilt named profile | Prefill tokens/s | Prompt seconds | Decode tokens/s |
+| --- | ---: | ---: | ---: |
+| First request | 112.66 | 76.018 | 1.48 |
+| Second request | 90.48 | 94.647 | 1.61 |
+| Median of these two requests | 101.57 | 85.333 | 1.54 |
+
+The repeated profile's median prefill rate was 6.77x the starting default and 2.39x the initial previous-prefill run. Median prompt time fell about 85.0% versus the starting default. The approximately 20% rate variation between requests is material; the initial 113.08 result is not a guaranteed sustained rate. Decode was approximately unchanged versus the starting default in these short samples and was not optimized. Evidence: `results-document-prefill-final.json` and `document-prefill-final.stderr.log`.
+
+A final fresh-process run used `--turbo-prefill --batch-size 4096 --ubatch-size 4096 --kv-offload` to restore the previous prefill configuration on the rebuilt executable. Logs confirmed both batch sizes were 4096 and both KV allocations were GPU F16 with 65536 context capacity. It measured 41.27 tokens/s prefill in 207.513 seconds and 1.99 tokens/s decode, with no cached tokens and the same response hash as the initial previous-profile run. The previous profile's two-run medians were 41.91 tokens/s prefill and 1.81 tokens/s decode. The updated preset was 2.42x faster in prefill, with about 15% lower decode throughput than the previous prefill profile. These comparisons remain subject to file-cache and output differences. Evidence: `results-document-ub4096-repeat.json` and `document-ub4096-repeat.stderr.log`.
+
+The 256 MiB read-ahead experiment was interrupted when VS Code closed, before generation and the final JSON report completed. Its main 8560-token block took 134.68 seconds, versus 71.13 seconds with 128 MiB read-ahead. This partial timing does not supply a final prefill/decode rate; 256 MiB was rejected and the 128 MiB default was retained. Previously completed JSON reports and source edits survived the interruption.
+
+Observed total dedicated GPU memory including desktop applications was about 13,100-13,300 MiB for the default, 14,500 MiB for the previous prefill profile, and 15,500-15,700 MiB for the larger configurations. The final CPU-KV profile allocates 1440.00 MiB global KV and 1803.75 MiB sliding-window KV in CPU RAM, a 6029.11 MiB CUDA compute buffer, and a 2083.91 MiB CUDA host compute buffer. Dedicated/shared memory per process and peak memory were not measured. Desktop GPU use limits headroom.
+
+Windows file caching was not reset or controlled between runs. These are sequential local observations, not a controlled speedup guarantee. Only 8564 prompt tokens were populated; the full 64K capacity was verified in `/props` and allocation logs, but performance at 64K populated tokens was not tested. Initial default and previous-prefill response hashes matched over 64 tokens; 6144 and 9216 hashes differed. Full-model perplexity, final-answer quality, and token-equivalent outputs across microbatches are not established.
+
+The new `--turbo-prefill` profile supplies batch 16384, microbatch 9216, `--no-kv-offload`, and explicit F16 KV. Decode, balanced, and no-argument settings retain their previous defaults. Native aliases and positive KV-offload options can replace profile defaults, as verified by the final comparison run. Rebuilding and packaging passed; all 14 mode-2 transfer cases passed byte-exactly, and the metadata-only logging regression passed. Conflicting profiles were rejected and the launcher forwarded profile help correctly. The Python benchmark now supports paired `--document` and `--prompt` paths, rejects a context other than one 65536-token slot, and saves both median prefill and decode rates after each completed request without saving conversation text. Python syntax and changed-file ASCII/whitespace checks passed; the CI-pinned `ty` checker was unavailable in the local Python environment and could not be installed from the configured package index. Benchmark servers were stopped after validation.
+
+Initial raw reports: `results-document-baseline-ub1024.json`, `results-document-ub4096.json`, `results-document-ub6144.json`, and `results-document-ub9216-cpukv.json`. Configuration and timing evidence is in the corresponding `document-*.stderr.log` files. All artifacts remain local.
+
 ## V0.2: user 7,482-token workload
 
 The user reran the same prompt workload with the V0.2 prefill profile. Both logs report 7,482 processed prompt tokens and a 65,536-token context. This is a single before/after observation; initial Windows file-cache state and other runtime conditions were not controlled, and the logs do not contain prompt hashes.
@@ -127,3 +182,29 @@ The dedicated regression passed at maximum verbosity with JSONL and parser debug
 An API check using the real model passed for normal chat (HTTP 200), streaming chat (HTTP 200 with completed SSE), and malformed JSON (HTTP 400). With `--verbose --log-jsonl`, request canaries and generated message/reasoning text were absent from terminal captures and the saved log. Hardware, HTTP metadata, and prompt timing records remained. The test report stores status codes and token usage only, without chat contents: `privacy-api-check.json`.
 
 Earlier API smoke tests and older log/result files described above predate this policy and have not been scrubbed. The updated policy applies to the bespoke executable, including Turbo mode 0. Other binaries retain their normal logging unless they explicitly install a metadata-only filter.
+
+## 2026-10-10: KV/context matrix (tests only)
+
+Completed 18 uncached full-document requests across 12 requested variants and one existing CPU-KV reference. Every request used sample-doc.txt plus sample-prompt.txt, the same chat template and 8564-token prompt hash, with 32K or 64K allocated capacity. The initial matrix generated 64 tokens; five confirmations generated 512 tokens. Diagnostics were enabled consistently in the fresh baselines and variants. CPU-only commands used -ngl 0 --device none --no-op-offload, with zero GPU layers/compute buffers confirmed. No profiles, server code, or CUDA graphs were changed.
+
+| 512-token confirmation | Batch / microbatch | Prefill t/s | Decode t/s | Minimum sampled free VRAM MiB |
+| --- | ---: | ---: | ---: | ---: |
+| GPU KV, 64K F16 | 4096 / 4096 | 40.16 | 2.74 | 2153 |
+| GPU KV, 64K Q8 | 4096 / 4096 | 40.88 | 2.76 | 3217 |
+| GPU KV, 64K Q8 | 16384 / 9216 | 117.68 | 3.12 | 412 |
+| GPU KV, 32K Q8 | 16384 / 9216 | 118.85 | 3.03 | 1368 |
+| CPU-only, 32K F16 | 4096 / 4096 | 20.08 | 1.91 | 15204 |
+
+64K Q8 at the original batch saved about 1064 MiB of sampled dedicated headroom with approximately unchanged throughput. Both larger Q8 GPU cases reached about 118 t/s prefill and 3.0-3.1 t/s decode; 32K Q8 left more free VRAM than 64K Q8 at that batch. CPU-only F16 prefill was faster than CPU-only Q8 in the initial matrix, but the entire model remains disk-backed because it exceeds RAM. Host staging consumed roughly 77-82% of the confirmed GPU prefill time, and all cases reached 99% RAM load. Raw logs retain per-tensor transfers, hardware observations, disk/page-input counters, and dedicated/shared GPU allocations for later investigation; no bottlenecks were fixed.
+
+Windows file cache and background activity were uncontrolled; repeated prefill varied materially. Capacity was allocated but only the document and generated tokens were populated. Output hashes differ across some variants, and output quality was not evaluated. All test servers were stopped. Full tables, exact commands, limitations, validation, and matching raw-log folders: [local benchmark summary](bespoke-tests/2026-10-10-kv-context/SUMMARY.md).
+
+## 2026-10-10: --prefill-kv preset validation
+
+Added the requested preset using the tested large-batch GPU configuration: 65536 context, q8_0 K/V on GPU, batch 16384 and microbatch 9216. The packaged executable and run-server.cmd accept --prefill-kv. Existing profiles and no-argument decode selection remain available.
+
+The named preset processed the complete sample-doc.txt plus sample-prompt.txt without KV/batch/context arguments supplied separately: 8564 prompt tokens, zero cache reuse and 512 generated tokens. Prefill measured 101.75 tokens/s and decode 3.12 tokens/s. Input, formatted-prompt and output hashes matched the earlier explicit configuration's 117.68/3.12 t/s run. Diagnostics were enabled at trace verbosity in both; Windows file-cache state and background usage were uncontrolled.
+
+Native long aliases and the negative KV option successfully overrode context, batch, microbatch, both KV types and placement, verified through actual model allocations. Profile and launcher help, conflicting-profile rejection and the existing privacy regression passed. Inputs and ggml-cuda.dll were unchanged, CUDA graphs were untouched, and both test servers were stopped. The executable was rebuilt and packaged using the existing generated compile/link commands after the normal Ninja build stalled; no build-system or performance bottleneck fixes were made.
+
+Measured memory, exact commands, native logs, GPU samples and Windows RAM/disk/page-input/dedicated/shared-memory counters are retained in matching folders: [preset results summary](bespoke-tests/2026-10-10-prefill-kv/SUMMARY.md).

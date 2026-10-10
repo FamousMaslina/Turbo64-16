@@ -24,6 +24,14 @@
 - MSYS is installed at `C:\msys64`.
 - `CUDA_HOME` is configured, and CUDA tools are available on `PATH`.
 - **CUDA graphs:** leave them alone - they're working extremely well.
+- Dont remove profiles. only add new ones
+
+## Performance benchmarks
+
+- The prefill benchmark document is `turbo64-16/sample-doc.txt`, relative to the `llama.cpp-b11475` repository root.
+- The benchmark prompt is `turbo64-16/sample-prompt.txt`, in the same directory.
+- When improving performance, run the model with `sample-doc.txt` as the prefill input and use `sample-prompt.txt` as the prompt. Measure prefill speed on this real document, not synthetic text.
+- For every requested speed change, benchmark the starting configuration before making changes unless a prefill or decode tokens-per-second (t/s) figure for that configuration is already available. Measure any missing prefill or decode baseline needed to evaluate the requested change, and compare the changed configuration using the same model and benchmark inputs.
 
 ---
 

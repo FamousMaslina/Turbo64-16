@@ -1,0 +1,21 @@
+{
+  "prompt_tokens": 8564,
+  "generated_tokens": 512,
+  "cache_n": 0,
+  "prefill_tps": 101.74894725660826,
+  "decode_tps": 3.123007020373104,
+  "prompt_seconds": 84.167947,
+  "peak_total_dedicated_vram_mib": 15886.0,
+  "minimum_total_free_vram_mib": 163.0,
+  "peak_process_shared_gpu_mib": 2294.0,
+  "minimum_free_ram_mib": 167.0,
+  "host_stage_seconds": 48.51991,
+  "requested_upload_gib": 102.497041015625,
+  "output_hash_matches_previous_explicit_config": true,
+  "configuration_and_override_checks": "passed",
+  "privacy_regression": "passed",
+  "test_servers_stopped": true,
+  "inputs_and_cuda_dll_unchanged": true,
+  "nvidia_samples": 49,
+  "pdh_samples": 49
+}

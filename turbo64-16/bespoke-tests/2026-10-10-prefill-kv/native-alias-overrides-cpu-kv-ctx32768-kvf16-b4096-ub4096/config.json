@@ -1,0 +1,42 @@
+{
+  "command": [
+    "C:\\Users\\Tudi\\Documents\\Tudi\\freelancer\\Turbo64-16\\llama.cpp-b11475\\turbo64-16\\bin\\llama-server.exe",
+    "--prefill-kv",
+    "--host",
+    "127.0.0.1",
+    "--port",
+    "5567",
+    "--no-warmup",
+    "--log-file",
+    "C:\\Users\\Tudi\\Documents\\Tudi\\freelancer\\Turbo64-16\\llama.cpp-b11475\\turbo64-16\\bespoke-tests\\2026-10-10-prefill-kv\\native-alias-overrides-cpu-kv-ctx32768-kvf16-b4096-ub4096\\server.technical.log",
+    "--ctx-size",
+    "32768",
+    "--batch-size",
+    "4096",
+    "--ubatch-size",
+    "4096",
+    "--cache-type-k",
+    "f16",
+    "--cache-type-v",
+    "f16",
+    "--no-kv-offload"
+  ],
+  "environment_overrides": {
+    "TURBO64_16": "2",
+    "TURBO64_16_DIAGNOSTICS": "1",
+    "LLAMA_ARG_LOG_VERBOSITY": "4"
+  },
+  "expected": {
+    "ctx": 32768,
+    "batch": 4096,
+    "microbatch": 4096,
+    "kv_backend": "CPU",
+    "kv_type": "f16"
+  },
+  "started_utc": "2026-10-10T08:38:19.966161+00:00",
+  "status": "passed",
+  "server_pid": 3220,
+  "configuration_verified": true,
+  "server_stopped": true,
+  "finished_utc": "2026-10-10T08:38:31.679776+00:00"
+}

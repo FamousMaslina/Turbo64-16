@@ -1,0 +1,52 @@
+{
+  "command": [
+    "C:\\Users\\Tudi\\Documents\\Tudi\\freelancer\\Turbo64-16\\llama.cpp-b11475\\turbo64-16\\bin\\llama-server.exe",
+    "--prefill-kv",
+    "--host",
+    "127.0.0.1",
+    "--port",
+    "5567",
+    "--no-warmup",
+    "--log-file",
+    "C:\\Users\\Tudi\\Documents\\Tudi\\freelancer\\Turbo64-16\\llama.cpp-b11475\\turbo64-16\\bespoke-tests\\2026-10-10-prefill-kv\\gpu-ctx65536-kvq8_0-b16384-ub9216\\server.technical.log"
+  ],
+  "environment_overrides": {
+    "TURBO64_16": "2",
+    "TURBO64_16_DIAGNOSTICS": "1",
+    "LLAMA_ARG_LOG_VERBOSITY": "4"
+  },
+  "expected": {
+    "ctx": 65536,
+    "batch": 16384,
+    "microbatch": 9216,
+    "kv_backend": "CUDA0",
+    "kv_type": "q8_0"
+  },
+  "started_utc": "2026-10-10T08:33:56.160437+00:00",
+  "status": "passed",
+  "server_pid": 29536,
+  "configuration_verified": true,
+  "benchmark_command": [
+    "C:\\Users\\Tudi\\AppData\\Local\\Python\\pythoncore-3.14-64\\python.exe",
+    "C:\\Users\\Tudi\\Documents\\Tudi\\freelancer\\Turbo64-16\\llama.cpp-b11475\\turbo64-16\\benchmark.py",
+    "--url",
+    "http://127.0.0.1:5567",
+    "--document",
+    "C:\\Users\\Tudi\\Documents\\Tudi\\freelancer\\Turbo64-16\\llama.cpp-b11475\\turbo64-16\\sample-doc.txt",
+    "--prompt",
+    "C:\\Users\\Tudi\\Documents\\Tudi\\freelancer\\Turbo64-16\\llama.cpp-b11475\\turbo64-16\\sample-prompt.txt",
+    "--repetitions",
+    "1",
+    "--generate",
+    "512",
+    "--label",
+    "prefill-kv-preset",
+    "--output",
+    "C:\\Users\\Tudi\\Documents\\Tudi\\freelancer\\Turbo64-16\\llama.cpp-b11475\\turbo64-16\\bespoke-tests\\2026-10-10-prefill-kv\\gpu-ctx65536-kvq8_0-b16384-ub9216\\results.json"
+  ],
+  "prefill_tokens_per_second": 101.74894725660826,
+  "decode_tokens_per_second": 3.123007020373104,
+  "reference_hashes_match": true,
+  "server_stopped": true,
+  "finished_utc": "2026-10-10T08:38:19.964902+00:00"
+}

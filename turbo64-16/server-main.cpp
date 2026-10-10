@@ -60,22 +60,29 @@ static void print_banner() {
 struct turbo_profile {
     const char * flag;
     const char * name;
+    const char * batch;
     const char * microbatch;
+    const char * kv_offload;
+    const char * kv_type;
 };
 
 static const turbo_profile profiles[] = {
-    {"--turbo-prefill",  "prefill",  "4096"},
-    {"--turbo-decode",   "decode",   "1024"},
-    {"--turbo-balanced", "balanced", "2048"},
+    {"--turbo-prefill",  "prefill",  "16384", "9216", "--no-kv-offload", "f16"},
+    {"--turbo-decode",   "decode",   "4096",  "1024", nullptr, nullptr},
+    {"--turbo-balanced", "balanced", "4096",  "2048", nullptr, nullptr},
+    {"--turbo-prefill2", "prefill2", "4096",  "4096", nullptr, nullptr},
+    {"--prefill-kv",     "prefill-kv", "16384", "9216", "--kv-offload", "q8_0"},
 };
 
 static void print_profiles() {
     std::fputs("\nTurbo64-16 profiles (select one; native arguments override profile defaults):\n"
-               "  --turbo-prefill   Prioritize prompt processing; microbatch 4096.\n"
+               "  --turbo-prefill   Prioritize prompt processing; batch 16384, microbatch 9216, CPU F16 KV.\n"
+               "  --turbo-prefill2  Restore the previous prefill settings; batch/microbatch 4096, GPU F16 KV.\n"
+               "  --prefill-kv      Use 64K GPU Q8 K/V; batch 16384, microbatch 9216.\n"
                "  --turbo-decode    Prioritize generation; microbatch 1024.\n"
                "  --turbo-balanced Use an intermediate microbatch of 2048.\n"
                "All profiles use the local MiMo model, 64K context, CPU MoE 47, 16/24 threads,\n"
-               "batch 4096, Flash Attention, mmap, one slot, Jinja and reasoning.\n"
+               "Flash Attention, mmap, one slot, Jinja and reasoning. Decode/balanced/prefill2 use batch 4096.\n"
                "No arguments selects --turbo-decode. Custom arguments without a profile retain native defaults.\n\n", stderr);
 }
 
@@ -252,7 +259,7 @@ int main(int argc, char ** argv) {
         const char * defaults[][2] = {
             {"-m", "C:/Users/Tudi/Documents/Tudi/AI/MiMo-V2.6-Flash-MOPD-Q2_K-00001-of-00002.gguf"},
             {"-c", "65536"}, {"-ngl", "all"}, {"--n-cpu-moe", "47"}, {"-t", "16"}, {"-tb", "24"},
-            {"-b", "4096"}, {"-ub", profile->microbatch}, {"-fa", "on"}, {"-lm", "mmap"},
+            {"-b", profile->batch}, {"-ub", profile->microbatch}, {"-fa", "on"}, {"-lm", "mmap"},
             {"-np", "1"}, {"--reasoning", "on"},
         };
         for (const auto & setting : defaults) {
@@ -261,6 +268,17 @@ int main(int argc, char ** argv) {
             }
             arguments.emplace_back(setting[0]);
             arguments.emplace_back(setting[1]);
+        }
+        if (profile->kv_offload && !specified.count(profile->kv_offload)) {
+            arguments.emplace_back(profile->kv_offload);
+        }
+        if (profile->kv_type) {
+            for (const char * option : {"-ctk", "-ctv"}) {
+                if (!specified.count(option)) {
+                    arguments.emplace_back(option);
+                    arguments.emplace_back(profile->kv_type);
+                }
+            }
         }
         set_default("TURBO64_16_READAHEAD_ASYNC", "1");
         set_default("TURBO64_16_READAHEAD_MIB", "128");

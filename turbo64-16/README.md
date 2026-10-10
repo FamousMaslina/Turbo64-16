@@ -2,35 +2,45 @@
 
 Opt-in Windows optimization for MiMo-V2.6-Flash on Ryzen 7950X, 64 GB RAM, Gen5 NVMe, RTX 4080. Based on the supplied llama.cpp-b11475 source archive. Maintained independently of ggml-org/llama.cpp; no upstream submission is intended.
 
-V0.2 processed the user's 7,482-token prompt at **47.64 tokens/s**, up from **14.19 tokens/s** in the previous Turbo run (3.36x). Prompt time fell from 527.21 to 157.06 seconds. Decode was approximately unchanged at 3.11 versus 3.18 tokens/s, with different output lengths. This is one observed comparison with uncontrolled file-cache state. See [results](RESULTS.md) and the [short update log](CHANGELOG.md).
+The document benchmark uses `sample-doc.txt` and `sample-prompt.txt`, formatted by the model's chat template into 8,564 tokens. Two runs of the rebuilt prefill profile measured **90.48-112.66 tokens/s**, with a **101.57 tokens/s median**, compared with the initial **15.01 tokens/s** default and **42.55 tokens/s** previous prefill profile. It retains 65,536 context capacity and F16 KV, with KV stored in CPU RAM to make room for a 9,216-token microbatch. Decode's median was 1.54 tokens/s versus the starting 1.51. Windows file-cache state was uncontrolled; see [results](RESULTS.md) for all measurements and limitations.
 
 ## Run
 
 From the source directory in Command Prompt:
 
 ```bat
-turbo64-16\run-server.cmd 2
+turbo64-16\run-server.cmd --turbo-prefill
 ```
 
-This uses the bespoke `turbo64-16\bin\llama-server.exe` and your original model, 64K context, `--n-cpu-moe 47`, 16 decode threads, 24 batch threads, batch 4096, microbatch 1024, Flash Attention, mmap, Jinja, and reasoning. It listens on all IPv4 interfaces (`0.0.0.0:5559`), including LAN. Stop any existing server on that port first. You can also run the bespoke executable without arguments to use the same model profile.
+This uses the bespoke `turbo64-16\bin\llama-server.exe` and your original model, 64K context, `--n-cpu-moe 47`, 16 decode threads, 24 batch threads, batch 16384, microbatch 9216, CPU F16 KV, Flash Attention, mmap, Jinja, and reasoning. It listens on all IPv4 interfaces (`0.0.0.0:5559`), including LAN. Stop any existing server on that port first. No-argument startup and `run-server.cmd 2` still select the original 1024 microbatch decode settings.
 
 Select a named profile directly on the packaged executable:
 
 ```bat
 turbo64-16\bin\llama-server.exe --turbo-prefill
+turbo64-16\bin\llama-server.exe --turbo-prefill2
+turbo64-16\bin\llama-server.exe --prefill-kv
 turbo64-16\bin\llama-server.exe --turbo-decode
 turbo64-16\bin\llama-server.exe --turbo-balanced
 ```
 
-| Flag | Microbatch | Purpose |
-| --- | ---: | --- |
-| `--turbo-prefill` | 4096 | Preserve the tested profile with the highest prompt-processing speed |
-| `--turbo-decode` | 1024 | Use the tested smaller batch with the highest observed generation speed |
-| `--turbo-balanced` | 2048 | Use an intermediate batch and memory footprint |
+| Flag | Batch | Microbatch | KV placement | Purpose |
+| --- | ---: | ---: | --- | --- |
+| `--turbo-prefill` | 16384 | 9216 | CPU, explicit F16 | Process the complete benchmark document in one large expert-transfer pass |
+| `--turbo-prefill2` | 4096 | 4096 | GPU, default F16 | Restore the prefill configuration from before the CPU-KV changes |
+| `--prefill-kv` | 16384 | 9216 | GPU, explicit Q8 K/V | Use the tested large-microbatch 64K GPU KV configuration |
+| `--turbo-decode` | 4096 | 1024 | GPU, default F16 | Retain the original generation profile |
+| `--turbo-balanced` | 4096 | 2048 | GPU, default F16 | Retain the intermediate batch and memory footprint |
 
-All three supply the same model, 64K context, CPU MoE 47, 16 decode/24 batch threads, batch 4096, Flash Attention, mmap, one slot, Jinja, reasoning, and default 128 MiB asynchronous read-ahead in mode 2. These are measured configuration choices, not guarantees across workloads or file-cache states. CPU prefetch is not included because the experiment slowed generation. CUDA graphs are unchanged.
+All five supply the same model, 64K context, CPU MoE 47, 16 decode/24 batch threads, Flash Attention, mmap, one slot, Jinja, reasoning, and default 128 MiB asynchronous read-ahead in mode 2. The CPU prefill profile adds `--no-kv-offload -ctk f16 -ctv f16`. The `--prefill-kv` preset adds `--kv-offload -ctk q8_0 -ctv q8_0`. These are measured configuration choices, not guarantees across workloads or file-cache states. CUDA graphs are unchanged.
 
-Choose only one profile per launch. Native options override its defaults, including aliases and negative options. For example, `llama-server.exe --turbo-prefill --ubatch-size 2048 --port 5560` changes microbatch and port. Existing environment overrides remain available. With no arguments the executable selects the decode profile; custom arguments without a profile retain the previous native-argument behavior. `--help` lists the profiles.
+Run the 64K GPU Q8 preset with `turbo64-16\run-server.cmd --prefill-kv`. Its configuration measured 117.68 tokens/s prefill and 3.12 tokens/s output in the earlier complete-document/512-token test. That run had 412 MiB minimum free dedicated VRAM, including desktop usage; see [the configuration matrix](bespoke-tests/2026-10-10-kv-context/SUMMARY.md) for memory measurements and file-cache limitations.
+
+The rebuilt named preset passed a full-document/512-token check at 101.75 tokens/s prefill and 3.12 tokens/s output, with the same input/output hashes as that earlier run. Native context, batch, microbatch, K/V type and negative placement overrides passed. See [preset validation](bespoke-tests/2026-10-10-prefill-kv/SUMMARY.md) for logs, memory samples and build details.
+
+Two full-document runs of the restored `--turbo-prefill2` profile measured 38.05-39.13 tokens/s prefill and 2.72-2.85 tokens/s output over 512 generated tokens, with medians of 38.59 and 2.78. Later output intervals measured about 3.1-3.3 tokens/s, while the complete output averages remained below 3. Run it with `turbo64-16\run-server.cmd --turbo-prefill2`; see RESULTS.md for the methodology and cache limitations.
+
+Choose only one profile per launch. Native options override its defaults, including aliases and negative options. For example, `llama-server.exe --turbo-prefill --ubatch-size 6144 --kv-offload` uses the tested 6144 microbatch with GPU KV. Select `--turbo-prefill2` to reproduce the previous prefill profile directly. Existing environment overrides remain available for read-ahead and diagnostics. With no arguments the executable selects the decode profile; custom arguments without a profile retain native-argument behavior. `--help` lists the profiles.
 
 The launcher also accepts these flags and forwards further server arguments: `turbo64-16\run-server.cmd --turbo-prefill`. The existing numeric mode and explicit microbatch syntax remains available.
 
@@ -66,7 +76,7 @@ Logging many details can affect benchmark throughput. For performance measuremen
 
 ```bat
 set TURBO64_16_DIAGNOSTICS=0
-turbo64-16\run-server.cmd 2
+turbo64-16\run-server.cmd --turbo-prefill
 ```
 
 The default logger then uses info verbosity. Set `LLAMA_ARG_LOG_VERBOSITY=4` for trace or `5` for debug. Set `LLAMA_ARG_LOG_FILE` to choose another file, or pass `--log-file`. Other native server arguments override the bespoke host/port/logging defaults. The full MiMo profile is supplied when no arguments are given or when a named Turbo profile is selected. Otherwise include `-m` and the model settings you want.
@@ -90,18 +100,18 @@ The custom upload path handles batches of at least 32 tokens. Smaller batches us
 With the server running, in another terminal:
 
 ```bat
-py turbo64-16\benchmark.py --tokens 1024 --repetitions 3 --generate 32 --label turbo2
+py turbo64-16\benchmark.py --document turbo64-16\sample-doc.txt --prompt turbo64-16\sample-prompt.txt --repetitions 3 --generate 64 --label document-prefill
 ```
 
-Restart with `turbo64-16\run-server.cmd 0` and repeat with `--label original`. Use mode 1 and `--label turbo1` to isolate staging's contribution. Results are written to `turbo64-16\results-<label>.json`. Each prompt has a different prefix and disables caching; the script rejects reused prefixes. It records prompt processing, generation timing, wall time, server properties, and token counts, without saving generated message text. A allocated 64K context with a 1024-token prompt does not measure attention at a filled 64K context.
+Results are written to `turbo64-16\results-<label>.json`. The document mode reads both UTF-8 files in full, applies the model's chat template, and uses the exact same tokenized prompt in every run. It requires one 65536-token slot, disables prompt caching, and rejects any cached tokens or an incomplete prompt count. It records prefill/decode timing, wall time, server properties, token counts, and input/output hashes without saving conversation text. Allocating a 64K context with this 8564-token prompt does not measure attention at a filled 64K context.
 
 Repeat the same workload and include both initial and later runs. Windows file caching makes a single result noisy. Do not compare a cached prompt against an uncached one. Report prompt/generation speeds, dedicated/shared GPU memory from Task Manager, RAM use, and whether normal chat output looks correct. Do not run stock and Turbo simultaneously.
 
-Use `--workload <name>` with the same token count and repetition count across fresh server launches for repeatable synthetic A/B prompts. Reports include prompt and response SHA-256 hashes without storing conversation text. The existing cache checks still reject reused prefixes. This synthetic workload is not the user's workload from the supplied log.
+The older synthetic mode remains available with `--tokens` and `--workload <name>` for transfer sanity checks. It varies prompt prefixes and rejects reused prefixes. Use the document mode for performance changes as required by AGENTS.md.
 
 The pre-update executable and DLLs are preserved locally under `baseline-log-build/`; `run-server.cmd baseline` runs that build with the original 1024 microbatch. `run-server.cmd 2 2048` or `run-server.cmd 2 4096` chooses a microbatch explicitly. The baseline binaries are local artifacts and are not included in the source patch.
 
-The named profiles provide the tested 1024, 2048 and 4096 microbatch settings, keeping `-b 4096`. Larger microbatches amortize expert reads across more tokens but need more compute memory. The 4096 profile fit on this PC during the recorded tests. More desktop GPU usage or a different workload can change available headroom. Shared GPU usage includes CUDA host allocations and by itself does not prove device-memory spill; compare dedicated usage and throughput as well.
+The prefill profile's 9216 microbatch amortizes expert reads over the complete benchmark document; the larger logical batch also avoids a split at 4096 tokens. CPU KV placement releases persistent GPU KV storage while retaining F16 precision and 64K capacity. Observed total dedicated GPU memory was approximately 15,500 MiB including desktop applications, with limited headroom. More desktop GPU usage or a different workload can change available headroom. Shared GPU usage was not measured in these document runs. The GPU-KV 6144 alternative also used about 15,500 MiB and had faster decode in the initial sample. See RESULTS.md for exact figures.
 
 ## Architecture and approach
 
@@ -109,7 +119,7 @@ The local GGUF metadata confirms 48 layers, hidden size 4096, 256 routed experts
 
 On this machine, CPU expert repacking can allocate anonymous copies of mapped weights. Retaining ordinary CPU buffers lets weights remain file-backed and lets the existing scheduler offload supported prefill matmuls to CUDA. Decode still runs through the normal scheduler. This removes an expert-weight duplication path; it does not make the entire model fit in RAM or eliminate disk reads.
 
-The existing selected-expert copy callback supplies actual routing IDs. Turbo coalesces consecutive selected experts, preserves the original MMQ padding, prefetches bounded windows using the existing Windows helper, and uploads chunks of at most 32 MiB. Two pinned host buffers let the host prepare the next chunk while a previous transfer completes. Events prevent overwriting a buffer still in use by the GPU; destruction waits for pending transfers. Read-ahead overlaps the current window's staging and never predicts future-layer routing. There is no cross-layer GPU compute/copy pipeline, persistent GPU expert cache, model rewriting, or quantization change. CUDA graphs and CUDA kernel sources are unchanged.
+The existing selected-expert copy callback supplies actual routing IDs. Turbo coalesces consecutive selected experts, preserves the original MMQ padding, prefetches bounded windows using the existing Windows helper, and uploads chunks of at most 32 MiB. Two pinned host buffers let the host prepare the next chunk while a previous transfer completes. Events prevent overwriting a buffer still in use by the GPU; destruction waits for pending transfers. Read-ahead overlaps the current window's staging and never predicts future-layer routing. There is no cross-layer GPU compute/copy pipeline, persistent GPU expert cache, model rewriting, or model-weight quantization change. CUDA graphs and CUDA kernel sources are unchanged.
 
 Sources:
 

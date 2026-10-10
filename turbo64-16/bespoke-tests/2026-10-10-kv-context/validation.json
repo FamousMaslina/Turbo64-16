@@ -1,0 +1,19 @@
+{
+  "completed_requests": 18,
+  "initial_tg64_requests": 13,
+  "confirmation_tg512_requests": 5,
+  "unique_configurations": 13,
+  "requested_variants": 12,
+  "existing_cpu_kv_reference": 1,
+  "prompt_tokens_each": 8564,
+  "cache_n_every_request": 0,
+  "total_prefill_tokens": 154152,
+  "generated_tokens": 3392,
+  "same_document_question_and_prompt_hashes": true,
+  "input_binary_and_original_benchmark_sha256_unchanged": true,
+  "model_file_sizes_and_mtimes_unchanged": true,
+  "all_cpu_only_runs_zero_gpu_layers_and_no_gpu_compute_buffers": true,
+  "benchmark_port_closed": true,
+  "local_harness_syntax_ascii_whitespace": "passed",
+  "python_type_checker": "ty is not installed; no package installation attempted"
+}
