@@ -2,6 +2,19 @@
 
 Windows prefill optimization and a LAN API server for MiMo-V2.6-Flash on Ryzen 7950X, 64 GB RAM, NVMe, and RTX 4080. Based on llama.cpp-b11475, with isolated patches and metadata-only server logs.
 
+## Benchmark results
+
+Turbo runs below use the target hardware above and allocate a 65,536-token context. Prefill measures prompt processing; decode measures output generation.
+
+| Build / configuration | Prefill (tokens/s) | Decode (tokens/s) | Workload / evidence |
+| --- | ---: | ---: | --- |
+| **v0.2.1 `--prefill-kv`**, GPU Q8 K/V, batch 16384 / microbatch 9216 | **101.75** | **3.12** | [8,564 prompt tokens / 512 output tokens](turbo64-16/bespoke-tests/2026-10-10-prefill-kv/SUMMARY.md) |
+| v0.2 GPU F16 settings re-tested, batch / microbatch 4096 | 40.16 | 2.74 | [Same document, 8,564 prompt tokens / 512 output tokens, tested on the updated binary](turbo64-16/bespoke-tests/2026-10-10-kv-context/gpu-ctx65536-kvf16-b4096-ub4096/confirm-tg512/results.json) |
+| v0.2 original `--turbo-prefill` run, GPU F16, batch / microbatch 4096 | 47.64 | 3.11 | [Earlier 7,482-token prompt / 421 output tokens](turbo64-16/RESULTS.md#v02-user-7482-token-workload) |
+| Stock llama.cpp, earlier user-reported reference | 8.35 | 3.83 | [Original build, prompt and output length not reproduced](turbo64-16/RESULTS.md#user-reported-long-prompt) |
+
+Windows file-cache state and background usage were uncontrolled. The historical v0.2 run used a different workload; the stock row is a reported reference rather than a matched benchmark. These observations do not establish a controlled speedup across versions. The 64K figure is allocated capacity; the Turbo prompts filled about 7.5K-8.6K tokens.
+
 ## Important Note!
 This project was fully vibe coded and built entirely to serve my own needs and hardware setup. I decided to put it here in case anyone else wants to try it too on their system and for easier sharing/upkeep. Nothing else or anything serious.
 
